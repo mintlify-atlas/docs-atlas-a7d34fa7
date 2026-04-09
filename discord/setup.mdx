@@ -1,0 +1,104 @@
+---
+title: "Discord bot setup"
+description: "Connect a Discord bot to the Heimdall control plane so you can deploy, monitor, and manage infrastructure from a Discord channel."
+---
+
+## Prerequisites
+
+- Heimdall control plane running and reachable (see [Quickstart](/quickstart))
+- A Discord account with permission to manage a server
+- Python environment with bot dependencies installed (`pip install -r requirements.txt`)
+
+## Create a Discord application
+
+<Steps>
+  <Step title="Open the Developer Portal">
+    Go to [https://discord.com/developers/applications](https://discord.com/developers/applications) and click **New Application**. Give it a name (e.g. `heimdall`) and click **Create**.
+  </Step>
+  <Step title="Create a bot user">
+    In the left sidebar, click **Bot**. Click **Add Bot**, then confirm. Under the **Token** section, click **Reset Token** and copy the value — you will need it for `.env`.
+
+    <Warning>
+      Treat your bot token like a password. Never commit it to source control. If it is exposed, reset it immediately from this page.
+    </Warning>
+  </Step>
+  <Step title="Generate an invite URL">
+    In the left sidebar, click **OAuth2 → URL Generator**.
+
+    Under **Scopes**, select:
+    - `bot`
+    - `applications.commands`
+
+    Under **Bot Permissions**, select:
+    - Send Messages
+    - Embed Links
+    - Read Message History
+
+    Copy the generated URL at the bottom of the page.
+  </Step>
+  <Step title="Invite the bot to your server">
+    Paste the URL into your browser, select your server from the dropdown, and click **Authorize**. The bot will appear in your server's member list as offline until you start it.
+  </Step>
+</Steps>
+
+## Configure Heimdall
+
+The bot reads its configuration from the same `.env` file as the rest of the Heimdall ecosystem. Add or update the following three variables:
+
+<Steps>
+  <Step title="Set your bot token">
+    Set `DISCORD_TOKEN` to the token you copied from the Developer Portal.
+  </Step>
+  <Step title="Point the bot at your control plane">
+    Set `INFRA_API_URL` to the base URL of your running control plane. If you are running everything on one machine, the default (`http://localhost:8000`) works as-is.
+  </Step>
+  <Step title="Set the API key">
+    Set `INFRA_API_KEY` to the same secret key configured on your control plane. The bot sends this value in every API request as the `X-API-Key` header.
+  </Step>
+</Steps>
+
+Your `.env` file should contain at least these entries for the bot:
+
+```bash .env
+DISCORD_TOKEN=your-bot-token-here
+INFRA_API_URL=http://localhost:8000
+INFRA_API_KEY=change-me
+```
+
+<Note>
+  The bot syncs all slash commands with Discord automatically on startup. This happens in the `on_ready` event via `await tree.sync()`, so commands will be available in your server within a few seconds of the bot coming online.
+</Note>
+
+## Start the bot
+
+**Using `start.sh` (recommended)**
+
+`start.sh` launches the control plane, node agent, and Discord bot together in a `tmux` session:
+
+```bash
+bash start.sh
+```
+
+The bot runs in the `bot` window of the `heimdall` tmux session. Logs are written to `logs/bot.log`.
+
+**Running the bot standalone**
+
+If you only need the bot (control plane is already running elsewhere):
+
+```bash
+python discord_bot/bot.py
+```
+
+**Viewing bot logs**
+
+```bash
+# Attach to the full tmux session
+tmux attach -t heimdall
+
+# Or tail the log file directly
+tail -f logs/bot.log
+```
+
+<Tip>
+  To stop everything started by `start.sh`, run `tmux kill-session -t heimdall`.
+</Tip>

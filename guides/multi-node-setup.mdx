@@ -1,0 +1,226 @@
+---
+title: "Multi-node setup"
+description: "Register multiple hosts, declare services on specific nodes, and deploy across your entire fleet from a single control plane."
+---
+
+A single Heimdall control plane can manage any number of nodes. Each node runs its own agent process. The control plane tracks which services live on which nodes and routes deployment commands accordingly.
+
+## When to use multiple nodes
+
+- You want to run different services on dedicated hosts (e.g., an API server and a background worker on separate machines).
+- You want to isolate workloads for resource or security reasons.
+- You have geographically distributed hosts that all need to be managed from one place.
+
+## How it works
+
+Each node agent connects back to the control plane via HMAC-signed webhooks. You register a node by telling the control plane its name, UUID, and the URL where its agent listens. After that, you declare services and assign them to specific nodes by name.
+
+<Note>
+`INFRA_API_KEY` must be identical on the control plane and on every agent. The control plane uses it to verify incoming webhook signatures, and each agent uses it to sign outgoing webhooks and to accept inbound commands.
+</Note>
+
+## Step-by-step: two nodes, two services
+
+This example registers two nodes — `node-1` running an API service and `node-2` running a background worker.
+
+<Steps>
+  <Step title="Start the control plane">
+    On the control plane host, set your environment variables and start the API:
+
+    ```bash
+    export INFRA_API_KEY=your-secret-key
+    export INFRA_API_URL=http://<control-plane-host>:8000
+    uvicorn api:app --host 0.0.0.0 --port 8000
+    ```
+
+    Verify it is running:
+
+    ```bash
+    curl http://localhost:8000/health
+    ```
+
+    ```json
+    {"status": "ok", "timestamp": 1712345678.0}
+    ```
+  </Step>
+
+  <Step title="Start the agent on node-1">
+    On the first host, set the agent environment and start it:
+
+    ```bash
+    export INFRA_API_KEY=your-secret-key
+    export INFRA_API_URL=http://<control-plane-host>:8000
+    export HEIMDALL_AGENT_PORT=8001
+    cd fastapi_agent
+    uvicorn main:app --host 0.0.0.0 --port 8001
+    ```
+
+    Or use `start-agent.sh` to run it inside a tmux session:
+
+    ```bash
+    INFRA_API_KEY=your-secret-key \
+    INFRA_API_URL=http://<control-plane-host>:8000 \
+    ./start-agent.sh
+    ```
+  </Step>
+
+  <Step title="Start the agent on node-2">
+    Repeat on the second host. The agent port can be the same (8001) since it runs on a different machine:
+
+    ```bash
+    export INFRA_API_KEY=your-secret-key
+    export INFRA_API_URL=http://<control-plane-host>:8000
+    export HEIMDALL_AGENT_PORT=8001
+    cd fastapi_agent
+    uvicorn main:app --host 0.0.0.0 --port 8001
+    ```
+  </Step>
+
+  <Step title="Register node-1">
+    Call `POST /nodes` on the control plane with the name, a unique UUID, and the URL where the agent is reachable:
+
+    ```bash
+    curl -X POST http://<control-plane-host>:8000/nodes \
+      -H "X-API-Key: your-secret-key" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "name": "node-1",
+        "uuid": "node-1",
+        "host": "http://<node-1-host>:8001"
+      }'
+    ```
+
+    ```json
+    {"status": "success", "message": "Node 'node-1' registered successfully."}
+    ```
+  </Step>
+
+  <Step title="Register node-2">
+    ```bash
+    curl -X POST http://<control-plane-host>:8000/nodes \
+      -H "X-API-Key: your-secret-key" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "name": "node-2",
+        "uuid": "node-2",
+        "host": "http://<node-2-host>:8001"
+      }'
+    ```
+
+    ```json
+    {"status": "success", "message": "Node 'node-2' registered successfully."}
+    ```
+
+    Confirm both nodes appear:
+
+    ```bash
+    curl http://<control-plane-host>:8000/nodes \
+      -H "X-API-Key: your-secret-key"
+    ```
+
+    ```json
+    [
+      {"name": "node-1", "uuid": "node-1", "host": "http://<node-1-host>:8001", "status": "ONLINE", "fail_count": 0, "last_seen": "..."},
+      {"name": "node-2", "uuid": "node-2", "host": "http://<node-2-host>:8001", "status": "ONLINE", "fail_count": 0, "last_seen": "..."}
+    ]
+    ```
+  </Step>
+
+  <Step title="Declare the API service on node-1">
+    ```bash
+    curl -X POST http://<control-plane-host>:8000/services \
+      -H "X-API-Key: your-secret-key" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "service": "api",
+        "node_name": "node-1",
+        "flake": "path:/home/user/api_service"
+      }'
+    ```
+
+    ```json
+    {"status": "success", "message": "Service 'api' declared on node 'node-1'."}
+    ```
+
+    When the control plane receives this request, it immediately calls the agent on `node-1` to inspect the flake and cache the manifest (commands and healthcheck URL).
+  </Step>
+
+  <Step title="Declare the worker service on node-2">
+    ```bash
+    curl -X POST http://<control-plane-host>:8000/services \
+      -H "X-API-Key: your-secret-key" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "service": "worker",
+        "node_name": "node-2",
+        "flake": "path:/home/user/worker_service"
+      }'
+    ```
+
+    ```json
+    {"status": "success", "message": "Service 'worker' declared on node 'node-2'."}
+    ```
+  </Step>
+
+  <Step title="Deploy everything">
+    Use `POST /deploy-all` to queue a deployment for every declared service at once. Heimdall sends each deploy command to the correct node automatically:
+
+    ```bash
+    curl -X POST http://<control-plane-host>:8000/deploy-all \
+      -H "X-API-Key: your-secret-key"
+    ```
+
+    ```json
+    {
+      "status": "success",
+      "message": "Queued 2 deployments.",
+      "operation_ids": ["<op-id-1>", "<op-id-2>"]
+    }
+    ```
+
+    Check the status of an individual deployment:
+
+    ```bash
+    curl http://<control-plane-host>:8000/operations/<op-id-1> \
+      -H "X-API-Key: your-secret-key"
+    ```
+  </Step>
+</Steps>
+
+## Deploying to a specific node
+
+To deploy a single service without touching others, use `POST /deploy`:
+
+```bash
+curl -X POST http://<control-plane-host>:8000/deploy \
+  -H "X-API-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "api",
+    "version": "latest"
+  }'
+```
+
+Because the service was declared with a `node_name`, Heimdall resolves the target node automatically. You can also pass `node_name` explicitly to override.
+
+## Node registration request format
+
+| Field  | Type   | Description                                                        |
+|--------|--------|--------------------------------------------------------------------|
+| `name` | string | Human-readable node identifier used in service declarations.       |
+| `uuid` | string | Unique identifier. Can match `name`; used for deduplication.       |
+| `host` | string | Base URL where the agent listens, e.g. `http://10.0.0.5:8001`.    |
+
+Calling `POST /nodes` with a `name` or `uuid` that already exists updates the node's `host` rather than creating a duplicate.
+
+## Agent environment variables
+
+Each agent host needs these two variables at minimum:
+
+| Variable           | Description                                                                 |
+|--------------------|-----------------------------------------------------------------------------|
+| `INFRA_API_URL`    | Base URL of the control plane, e.g. `http://10.0.0.1:8000`. No trailing slash. |
+| `INFRA_API_KEY`    | Shared secret. Must match the value on the control plane exactly.           |
+| `HEIMDALL_AGENT_PORT` | Port the agent listens on. Defaults to `8001`.                           |
+
+The agent validates `INFRA_API_URL` and `INFRA_API_KEY` at startup and refuses to start if either is missing.

@@ -1,0 +1,109 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Heimdall",
+  "projectDescription": "A distributed node orchestration and health monitoring platform with a FastAPI control plane, signed-webhook node agents, and a Discord ChatOps interface for deploying, managing, and rolling back Nix-flake-defined services across multiple hosts.",
+  "theme": "aspen",
+  "primaryColor": "#ce300c",
+  "lightColor": "#24718e",
+  "darkColor": "#efdcb8",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "configuration"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/nodes-and-services",
+              "architecture/webhooks-and-security"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deploy",
+              "operations/teardown-and-rollback",
+              "operations/health-monitoring"
+            ]
+          },
+          {
+            "group": "Discord Bot",
+            "pages": [
+              "discord/setup",
+              "discord/commands"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/nix-flake-manifest",
+              "guides/multi-node-setup",
+              "guides/self-hosting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Control Plane",
+            "pages": [
+              "api/overview",
+              "api/nodes",
+              "api/services",
+              "api/operations",
+              "api/webhook"
+            ]
+          },
+          {
+            "group": "Node Agent",
+            "pages": [
+              "api/agent-overview",
+              "api/agent-endpoints"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Distributed node orchestration with a central FastAPI control plane",
+    "HMAC-signed webhook protocol for secure agent-to-control-plane communication",
+    "Health-aware deployment with automatic service status tracking (healthy/dead/failed)",
+    "Nix flake manifest-driven deployments with inspect, deploy, teardown, and rollback commands",
+    "Discord ChatOps integration for deploying and monitoring infrastructure from a chat interface",
+    "Async log streaming from agents to the control plane via batched webhooks",
+    "Operation audit log with triggered-by attribution for all infrastructure changes",
+    "Automatic node heartbeat monitoring with configurable fail thresholds"
+  ],
+  "publicApiSurface": [
+    "POST /webhook — HMAC-signed event ingestion (node_status, status, logs_batch)",
+    "POST /nodes — Register or update an infrastructure node",
+    "GET /nodes — List all registered nodes with status",
+    "POST /services — Declare a service on a node with Nix flake reference",
+    "GET /services — List all services and their current status",
+    "GET /services/{service_name} — Get service details",
+    "POST /deploy — Deploy a specific service to a node",
+    "POST /deploy-all — Bulk deploy all declared services",
+    "POST /command — Run a manifest-defined command for a service",
+    "POST /teardown — Decommission a service from its node",
+    "POST /rollback — Roll back a service to a target version",
+    "GET /operations — List recent operations",
+    "GET /operations/{operation_id} — Get operation status",
+    "GET /operations/audit — View audit log with attribution",
+    "GET /health — Control plane health check",
+    "GET /heartbeat (agent) — Agent liveness probe",
+    "POST /command (agent) — Execute a Nix flake command on the agent",
+    "POST /inspect (agent) — Inspect a Nix flake manifest"
+  ]
+}

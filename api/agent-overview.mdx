@@ -1,0 +1,139 @@
+---
+title: "Agent overview"
+description: "What the node agent is, how it authenticates requests, its background tasks, and all environment variables it reads."
+---
+
+The node agent is a lightweight FastAPI process that runs on each infrastructure host. It is the execution layer of Heimdall: it receives commands from the control plane, runs Nix flake services as subprocesses, tracks their health, and streams state back over signed webhooks. You deploy one agent per host.
+
+The agent starts on port `8001` by default (`HEIMDALL_AGENT_PORT`).
+
+## Endpoints
+
+| Method | Path | Auth | Description |
+| ------ | ---- | ---- | ----------- |
+| `GET` | `/heartbeat` | None | Liveness probe — returns `{"status": "ok"}` |
+| `POST` | `/command` | HMAC | Execute a Nix flake command |
+| `POST` | `/inspect` | HMAC | Inspect a Nix flake manifest |
+
+See [Agent endpoints](/api/agent-endpoints) for full request and response details.
+
+## Authentication
+
+Authenticated endpoints (`/command` and `/inspect`) use HMAC-SHA256 request signing. The control plane must include two headers on every request:
+
+| Header | Description |
+| ------ | ----------- |
+| `X-Timestamp` | Unix timestamp (seconds) of when the request was signed |
+| `X-Signature` | HMAC-SHA256 hex digest of `<request body> + <timestamp>` |
+
+The agent rejects any request where the timestamp is more than **30 seconds** from the current time, which prevents replay attacks. Signatures are computed with the shared `INFRA_API_KEY` as the HMAC key.
+
+```python
+import hmac, hashlib, time, json
+
+def sign(body: dict, secret: str) -> tuple[str, str]:
+    body_str = json.dumps(body)
+    timestamp = str(int(time.time()))
+    message = body_str + timestamp
+    signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return timestamp, signature
+```
+
+<Warning>
+  `HEIMDALL_ALLOW_INSECURE_SIGNATURES=1` lets callers bypass signature
+  verification by sending `X-Signature: default-signature`. This exists only
+  for local testing. Never enable it in production.
+</Warning>
+
+## Background tasks
+
+The agent starts three background tasks at startup. You can disable all three by setting `HEIMDALL_AGENT_DISABLE_BG=1` (useful in tests).
+
+<AccordionGroup>
+  <Accordion title="Heartbeat sender — every 10 seconds">
+    Sends a `node_status` webhook to the control plane containing the current
+    `service_state` map (PID, status, and health URL for every tracked service).
+    The control plane uses these events to keep `ServiceInstance` rows up to date.
+
+    ```json
+    {
+      "type": "node_status",
+      "services": {
+        "my-service": { "pid": 12345, "status": "healthy", "health_url": "http://localhost:3000/health" }
+      }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Health check loop — every 5 seconds">
+    Iterates over every service in `service_state` and checks its health by:
+
+    1. Sending `os.kill(pid, 0)` — if the PID is alive, status is `healthy`; if
+       the OS raises `OSError`, status is `dead`.
+    2. If a `health_url` is configured, making a `GET` request to it — a `200`
+       response sets `healthy`, anything else sets `unhealthy`.
+
+    When the status changes, the agent immediately sends a `status` webhook to
+    the control plane so it can resolve the in-progress operation.
+  </Accordion>
+
+  <Accordion title="Log flush loop — every 5 seconds">
+    Drains the in-memory `log_buffer` and sends all buffered lines as a single
+    `logs_batch` webhook. Each line in the batch includes the service name,
+    stream name (`stdout` or `stderr`), and the log text.
+
+    ```json
+    {
+      "type": "logs_batch",
+      "logs": [
+        { "service": "my-service", "stream": "stdout", "log": "Server listening on :3000" }
+      ]
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## State persistence
+
+The agent writes `service_state` to a JSON file (`HEIMDALL_STATE_FILE`, default `fastapi_agent/state.json`) every time a service status changes. On restart, the agent reads this file and checks whether each stored PID is still alive:
+
+- If the process is still running, the service is restored as `healthy`.
+- If the process is gone, it is restored as `dead`.
+
+This means a brief agent restart does not lose track of services that stayed running.
+
+## Environment variables
+
+<ParamField path="INFRA_API_URL" type="string" required>
+  Base URL of the control plane. The agent appends `/webhook` to this value and
+  POSTs all events there. Example: `http://control-plane:8000`
+</ParamField>
+
+<ParamField path="INFRA_API_KEY" type="string" required>
+  Shared secret used for HMAC-SHA256 signing. Must match the value configured
+  on the control plane. The agent refuses to start if this is unset.
+</ParamField>
+
+<ParamField path="HEIMDALL_AGENT_PORT" type="number" default="8001">
+  Port the agent listens on.
+</ParamField>
+
+<ParamField path="HEIMDALL_STATE_FILE" type="string" default="fastapi_agent/state.json">
+  Path to the JSON file where service state is persisted across restarts.
+</ParamField>
+
+<ParamField path="HEIMDALL_LOG_DIR" type="string" default="logs/">
+  Directory where per-service log files are written. The agent creates the
+  directory if it does not exist. Each service gets its own `<service>.log`
+  file.
+</ParamField>
+
+<ParamField path="HEIMDALL_AGENT_DISABLE_BG" type="string" default="0">
+  Set to `1` to skip starting the heartbeat sender, health check loop, and log
+  flush loop. Use this in tests or when you want to drive the agent manually.
+</ParamField>
+
+<ParamField path="HEIMDALL_ALLOW_INSECURE_SIGNATURES" type="string" default="0">
+  Set to `1` to accept `X-Signature: default-signature` without verifying the
+  HMAC. Development and testing only — never enable in production.
+</ParamField>

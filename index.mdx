@@ -1,97 +1,61 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Heimdall — Distributed Node Orchestration"
+description: "Deploy, monitor, and manage services across multiple nodes with a FastAPI control plane, HMAC-signed agents, and Discord ChatOps."
 ---
 
-## Setting up
+Heimdall is a distributed infrastructure orchestration platform. It gives you a central control plane to deploy Nix-flake-defined services across multiple hosts, track their health in real time, and operate them from Discord — without touching a terminal on every machine.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get the control plane and your first agent running in under 10 minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="diagram-project" href="/architecture/overview">
+    Understand how the control plane, agents, and webhooks fit together.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Full reference for every control plane and agent endpoint.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Discord Bot" icon="discord" href="/discord/setup">
+    Deploy and monitor your infrastructure directly from a Discord channel.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## How it works
 
-Everything you need to create world-class documentation.
+Heimdall has two components that work together:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+**Control Plane** — A FastAPI server that stores node and service state in SQLite, accepts signed webhook events from agents, and exposes a REST API for deployments, rollbacks, and auditing.
 
-## Need inspiration?
+**Node Agent** — A lightweight FastAPI process that runs on each host. It receives deployment commands from the control plane, executes `nix run` to start services, streams logs back, and sends health status updates via signed webhooks.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Register your nodes">
+    Add each host to Heimdall so the control plane knows where to send deployments.
+  </Step>
+  <Step title="Declare your services">
+    Point Heimdall at a Nix flake that defines how your service is built and run.
+  </Step>
+  <Step title="Deploy">
+    Trigger a deployment via the REST API or a Discord slash command — Heimdall handles the rest.
+  </Step>
+  <Step title="Monitor">
+    Watch real-time health status, stream logs, and roll back instantly if something goes wrong.
+  </Step>
+</Steps>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="HMAC-signed webhooks" icon="shield-halved" href="/architecture/webhooks-and-security">
+    All agent-to-control-plane communication is authenticated with HMAC-SHA256 signatures and replay-attack protection via timestamps.
+  </Card>
+  <Card title="Nix flake manifests" icon="snowflake" href="/guides/nix-flake-manifest">
+    Services are defined entirely in Nix flakes, giving you reproducible builds and a single source of truth for deploy, teardown, and healthcheck commands.
+  </Card>
+  <Card title="Operation audit log" icon="clock-rotate-left" href="/operations/deploy">
+    Every deployment, rollback, and teardown is recorded with who triggered it, when it ran, and whether it succeeded.
+  </Card>
+  <Card title="Multi-node support" icon="server" href="/guides/multi-node-setup">
+    Register any number of nodes and deploy different services to different hosts — or bulk-deploy everything at once.
+  </Card>
+</CardGroup>

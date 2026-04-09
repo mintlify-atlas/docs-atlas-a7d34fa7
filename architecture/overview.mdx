@@ -1,0 +1,103 @@
+---
+title: "Architecture overview"
+description: "How the Heimdall control plane and node agents fit together — data flow, database layout, and component responsibilities."
+---
+
+Heimdall is built around two cooperating processes: a **control plane** that stores state and drives operations, and a **node agent** that runs on every managed host and executes workloads. They communicate exclusively through HMAC-signed HTTP: agents push events to the control plane's `/webhook` endpoint, and the control plane pushes commands back to the agent's `/command` endpoint.
+
+## System diagram
+
+```
+┌──────────────────────┐        signed webhooks        ┌──────────────────────────┐
+│   Agent (node host)  │ ────────────────────────────▶ │     Control Plane        │
+│  - runs services     │                                │   FastAPI + DB           │
+│  - health checks     │                                │   /webhook + /services   │
+│  - logs batching     │ ◀────────────────────────────  │   API + status tracking  │
+└──────────────────────┘        instructions/API        └──────────────────────────┘
+```
+
+## Components
+
+<CardGroup cols={2}>
+  <Card title="Control plane" icon="server">
+    Runs `api.py` (FastAPI). Accepts signed webhook events from agents, persists
+    node and service state to SQLite, exposes a REST API for deployments,
+    rollbacks, teardowns, and audit logs, and runs a background monitor that
+    polls each node's `/heartbeat` to track liveness.
+  </Card>
+  <Card title="Node agent" icon="microchip">
+    Runs `fastapi_agent/main.py` (FastAPI). Receives `CommandRequest` payloads
+    from the control plane, executes `nix run` to start services, streams
+    stdout/stderr to a log buffer, runs periodic health checks against each
+    service's `healthcheck_url`, and sends `node_status`, `status`, and
+    `logs_batch` events back to the control plane.
+  </Card>
+</CardGroup>
+
+## Data flow
+
+The agent is always the one initiating communication to the control plane. The control plane initiates communication only when sending a command to a specific node.
+
+<Steps>
+  <Step title="Agent starts up">
+    The node agent loads persisted state from `state.json`, launches background
+    tasks for heartbeating, health checking, and log flushing, then begins
+    listening on its port (default `8001`).
+  </Step>
+  <Step title="Agent sends node_status events">
+    Every 10 seconds the agent sends a `node_status` webhook to the control
+    plane's `/webhook` endpoint containing the PID and status of every tracked
+    service. The control plane updates the corresponding `ServiceInstance` rows
+    in the database.
+  </Step>
+  <Step title="Agent sends status events">
+    When a service's health status changes — from `booting` to `healthy`, or
+    from `healthy` to `dead` — the agent immediately sends a `status` event.
+    The control plane resolves the in-progress `Operation` for that service and
+    marks it `success` or `failed`.
+  </Step>
+  <Step title="Agent sends logs_batch events">
+    Every 5 seconds the agent flushes its in-memory log buffer as a
+    `logs_batch` event. The control plane currently prints each line to its
+    own stdout so all node logs converge in one place.
+  </Step>
+  <Step title="Control plane sends commands">
+    When you call `POST /deploy`, `/command`, or `/teardown`, the control plane
+    resolves the target node's host URL from the database and POSTs a signed
+    `CommandRequest` to `{node.host}/command` on the agent. The agent executes
+    `nix run` and the status cycle begins again.
+  </Step>
+</Steps>
+
+## Database
+
+Heimdall uses a single SQLite file (`heimdall.db`) with three tables managed by SQLAlchemy.
+
+| Table               | Purpose                                                              |
+| ------------------- | -------------------------------------------------------------------- |
+| `nodes`             | One row per registered host — name, UUID, URL, status, fail count   |
+| `service_instances` | One row per service on a node — flake ref, commands, healthcheck URL |
+| `operations`        | One row per lifecycle event — type, status, timestamps, errors       |
+
+Relationships: each `Node` owns many `ServiceInstance` rows (cascade delete). Each `ServiceInstance` owns many `Operation` rows (cascade delete).
+
+<Note>
+  The database is initialised automatically on startup via `init_db()` in
+  `db.py`. Schema migrations are handled inline — missing columns are added and
+  legacy columns are dropped without requiring a manual migration step.
+</Note>
+
+## Background monitor
+
+The control plane runs a `monitor()` coroutine for the lifetime of the process. Every `MONITOR_INTERVAL_SECONDS` (default `5`s) it fetches all node IDs and fires a `check_node()` task for each one. `check_node()` sends a `GET /heartbeat` to the node's host URL. A successful `200` response resets `fail_count` and sets `status = "ONLINE"`. A failed request increments `fail_count`; once it reaches `FAIL_THRESHOLD` (default `3`), the node is marked `"OFFLINE"`.
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card title="Nodes and services" icon="diagram-project" href="/architecture/nodes-and-services">
+    Data models, lifecycle states, and what happens when a node goes offline.
+  </Card>
+  <Card title="Webhooks and security" icon="shield-halved" href="/architecture/webhooks-and-security">
+    HMAC signing, timestamp replay protection, and API key authentication.
+  </Card>
+</CardGroup>

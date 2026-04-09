@@ -1,0 +1,170 @@
+---
+title: "Health monitoring"
+description: "How Heimdall tracks node availability and service health in real time."
+---
+
+Heimdall uses two independent health-check mechanisms that run concurrently: the control plane
+polling agents for node availability, and each agent checking its own services for process and
+HTTP health.
+
+## Node heartbeat monitoring
+
+The control plane runs a background monitor loop that wakes every `MONITOR_INTERVAL_SECONDS`
+(default **5 seconds**) and sends a `GET /heartbeat` request to every registered node.
+
+- A `200 OK` response sets the node status to `ONLINE` and resets its failure counter.
+- Any connection error or non-200 response increments `fail_count` by 1.
+- Once `fail_count` reaches `FAIL_THRESHOLD` (default **3**), the node is marked `OFFLINE`.
+
+The heartbeat request must complete within `HEARTBEAT_TIMEOUT_SECONDS`. If the node does not
+respond in time, the attempt counts as a failure.
+
+### Node statuses
+
+| Status    | Meaning                                                                      |
+| --------- | ---------------------------------------------------------------------------- |
+| `ONLINE`  | The node responded to the most recent heartbeat.                             |
+| `OFFLINE` | The node has failed `FAIL_THRESHOLD` consecutive heartbeat checks.           |
+| `UNKNOWN` | The node has been registered but has not yet been checked (initial state).   |
+
+## Service health checks
+
+Each agent runs a health-check loop every **5 seconds** against every service it manages:
+
+1. **Process check** — the agent calls `os.kill(pid, 0)` to verify the process is still alive.
+   If the process is gone, status becomes `dead`.
+2. **HTTP health check** — if the service has a `healthcheck_url` (set from the Nix manifest's
+   `healthcheck_url` field), the agent sends `GET <healthcheck_url>` with a 2-second timeout.
+   A `200` response sets status to `healthy`; anything else sets it to `unhealthy`.
+
+When the status changes, the agent immediately sends a signed webhook to the control plane:
+
+```json
+{
+  "type": "status",
+  "service": "api",
+  "status": "healthy"
+}
+```
+
+The control plane finds the most recent `running` operation for that service and resolves it:
+
+| Agent status | Operation result |
+| ------------ | ---------------- |
+| `healthy`    | `success`        |
+| `stopped`    | `success`        |
+| `dead`       | `failed`         |
+| `failed`     | `failed`         |
+
+### Service statuses
+
+| Status      | Meaning                                                                                  |
+| ----------- | ---------------------------------------------------------------------------------------- |
+| `idle`      | The service is declared but has never been deployed.                                     |
+| `booting`   | `nix run` has started; the service has not yet passed a health check.                    |
+| `healthy`   | The process is alive and the HTTP health check (if configured) returned 200.             |
+| `unhealthy` | The process is alive but the HTTP health check returned a non-200 status or timed out.   |
+| `dead`      | The process exited unexpectedly (non-zero or PID disappeared).                           |
+| `failed`    | The agent reported a startup or runtime failure.                                         |
+| `stopped`   | The process exited cleanly with code 0.                                                  |
+
+## Checking node status
+
+`GET /nodes` returns the current state of every registered node, including its last-seen timestamp
+and failure counter.
+
+```bash
+curl http://localhost:8000/nodes \
+  -H "X-API-Key: your-api-key"
+```
+
+```json
+[
+  {
+    "name": "node-1",
+    "uuid": "node-1-unique-id",
+    "host": "http://10.0.0.5:8001",
+    "status": "ONLINE",
+    "fail_count": 0,
+    "last_seen": "2026-04-09T12:00:05Z"
+  },
+  {
+    "name": "node-2",
+    "uuid": "node-2-unique-id",
+    "host": "http://10.0.0.6:8001",
+    "status": "OFFLINE",
+    "fail_count": 3,
+    "last_seen": "2026-04-09T11:58:50Z"
+  }
+]
+```
+
+## Checking service status
+
+`GET /services/{service_name}` returns the current status and health-check URL for a single service.
+
+```bash
+curl http://localhost:8000/services/api \
+  -H "X-API-Key: your-api-key"
+```
+
+```json
+{
+  "name": "api",
+  "status": "healthy",
+  "healthcheck_url": "http://10.0.0.5:3000/health",
+  "node": "node-1"
+}
+```
+
+## Control plane health endpoint
+
+`GET /health` returns the control plane's own status and the current server timestamp. Use this
+to verify the control plane itself is reachable.
+
+```bash
+curl http://localhost:8000/health
+```
+
+```json
+{
+  "status": "ok",
+  "timestamp": 1744214400.123
+}
+```
+
+This endpoint does not require an API key.
+
+---
+
+<AccordionGroup>
+  <Accordion title="What happens when a node goes OFFLINE?">
+    When a node's `fail_count` reaches `FAIL_THRESHOLD` the control plane sets its status to
+    `OFFLINE` in the database. The `OFFLINE` flag is informational — the control plane does not
+    automatically block new deployments to that node. You can still call `POST /deploy`, but the
+    command will fail to reach the agent if the host is genuinely unreachable.
+
+    Services running on the offline node continue running on the host — Heimdall does not stop
+    them. However, the agent's health-check webhooks will not reach the control plane while the
+    connection is down, so the control plane's view of service health may become stale.
+
+    Once the node recovers and responds to a heartbeat, its status resets to `ONLINE` and
+    `fail_count` resets to `0`. The agent will resume sending status webhooks on its next health
+    loop tick (within 5 seconds), which brings the control plane back in sync.
+  </Accordion>
+  <Accordion title="What is the difference between dead and failed?">
+    Both statuses mean the service is no longer running, but they come from different detection paths:
+
+    - **`dead`** — the agent's health-check loop detected that the process PID disappeared (the
+      process exited unexpectedly, without a clean exit code 0). This is set by `os.kill(pid, 0)`
+      raising `OSError`, meaning the OS has no record of that PID.
+
+    - **`failed`** — the process exited with a non-zero return code. The agent's `wait_and_release`
+      coroutine catches the return code when the process terminates and sends
+      `{"type": "status", "status": "failed", "error": "exit code N"}` to the control plane.
+
+    In both cases the corresponding operation is marked `failed` in the database. The `error`
+    field on the operation contains the exit code string for `failed`, and is `null` for `dead`
+    (since there is no exit code to report when the PID simply vanishes).
+  </Accordion>
+</AccordionGroup>

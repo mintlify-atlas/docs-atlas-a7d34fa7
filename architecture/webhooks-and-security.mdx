@@ -1,0 +1,161 @@
+---
+title: "Webhooks and security"
+description: "HMAC-SHA256 signing, timestamp replay protection, event payload reference, and API key authentication for control plane endpoints."
+---
+
+Heimdall uses two independent authentication mechanisms: **HMAC-SHA256 signatures** for all agent↔control-plane webhook traffic, and **API key authentication** for every control plane REST endpoint that modifies state.
+
+## HMAC-SHA256 signing
+
+Every webhook sent by the agent (and every command sent by the control plane to the agent) is signed with `INFRA_API_KEY` using HMAC-SHA256. Both sides share the same key — set it as an environment variable on the control plane **and** on every node agent.
+
+### How the signature is generated
+
+The agent concatenates the raw JSON body string with the Unix timestamp string, then computes an HMAC-SHA256 hex digest of that message.
+
+```python
+def generate_signature(body_str: str, timestamp: str) -> str:
+    message = body_str + timestamp
+    return hmac.new(SECRET_KEY, message.encode(), hashlib.sha256).hexdigest()
+```
+
+`SECRET_KEY` is `INFRA_API_KEY` encoded as UTF-8 bytes. The signature is sent in the `X-Signature` header; the timestamp is sent separately in `X-Timestamp`.
+
+### How the control plane verifies it
+
+```python
+def verify_webhook_signature(payload: bytes, x_signature: str, x_timestamp: str | None = None):
+    if x_timestamp:
+        ts = int(x_timestamp)
+        if abs(time.time() - ts) > WEBHOOK_TTL_SECONDS:
+            raise HTTPException(status_code=400, detail="Webhook timestamp expired")
+        message = payload.decode('utf-8') + x_timestamp
+        expected = hmac.new(INFRA_API_KEY.encode("utf-8"), message.encode('utf-8'), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, x_signature):
+            raise HTTPException(status_code=401, detail="Invalid agent webhook signature")
+```
+
+The control plane always uses `hmac.compare_digest` for the final comparison to prevent timing attacks.
+
+## Timestamp replay protection
+
+Every webhook must include a Unix timestamp in the `X-Timestamp` header. The control plane rejects any request whose timestamp is more than `WEBHOOK_TTL_SECONDS` from the current time.
+
+| Config variable       | Default | Description                                          |
+| --------------------- | ------- | ---------------------------------------------------- |
+| `WEBHOOK_TTL_SECONDS` | `60`    | Maximum age (in seconds) of an accepted webhook      |
+
+If the timestamp is missing the control plane falls back to legacy signature verification (the `sha256=` prefix style). Use the agent-style signing — with an `X-Timestamp` header — for all new integrations.
+
+<Warning>
+  **Security best practices**
+
+  - `INFRA_API_KEY` must be a strong random secret (at least 32 bytes of entropy). Generate one with `openssl rand -hex 32`.
+  - Use a **different** `INFRA_API_KEY` per environment. A key compromised in staging must not affect production.
+  - Never log the key or include it in error responses.
+  - Keep `WEBHOOK_TTL_SECONDS` at 60 or lower. Increasing it widens the replay attack window.
+</Warning>
+
+## Webhook event types
+
+The agent sends three event types to `POST /webhook` on the control plane.
+
+### node_status
+
+Sent every 10 seconds as a heartbeat. Contains the current status of all services the agent is tracking.
+
+```json
+{
+  "type": "node_status",
+  "services": {
+    "api": {
+      "pid": 12345,
+      "status": "healthy"
+    }
+  }
+}
+```
+
+The control plane iterates over `services` and updates the `status` field of each matching `ServiceInstance`.
+
+### status
+
+Sent immediately when a service's health state changes. Used by the control plane to resolve in-progress operations.
+
+```json
+{
+  "type": "status",
+  "service": "api",
+  "status": "healthy",
+  "error": null
+}
+```
+
+Valid `status` values: `booting`, `healthy`, `stopped`, `dead`, `failed`.
+
+| Agent status | Operation outcome |
+| ------------ | ----------------- |
+| `healthy`    | `success`         |
+| `stopped`    | `success`         |
+| `dead`       | `failed`          |
+| `failed`     | `failed`          |
+
+### logs_batch
+
+Sent every 5 seconds when there are buffered log lines. Each entry includes the service name, stream (`stdout` or `stderr`), and the log line.
+
+```json
+{
+  "type": "logs_batch",
+  "logs": [
+    {
+      "service": "api",
+      "stream": "stdout",
+      "log": "Server started on port 8080"
+    }
+  ]
+}
+```
+
+The control plane currently prints each log line to its own stdout, prefixed with the service name and stream.
+
+## Signed request example
+
+Here is a complete example of sending a signed `node_status` webhook manually with curl. Replace `your-secret-key` with your actual `INFRA_API_KEY`.
+
+```bash
+BODY='{"type":"node_status","services":{"api":{"pid":12345,"status":"healthy"}}}'
+TIMESTAMP=$(date +%s)
+SIGNATURE=$(echo -n "${BODY}${TIMESTAMP}" | openssl dgst -sha256 -hmac "your-secret-key" | awk '{print $2}')
+
+curl -X POST https://your-control-plane/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Timestamp: ${TIMESTAMP}" \
+  -H "X-Signature: ${SIGNATURE}" \
+  -d "${BODY}"
+```
+
+<Note>
+  The shell command above concatenates `BODY` and `TIMESTAMP` as plain strings
+  before computing the HMAC — this matches exactly what `generate_signature`
+  does in Python: `message = body_str + timestamp`.
+</Note>
+
+## API key authentication for control plane endpoints
+
+All control plane endpoints that modify state (deploy, teardown, rollback, command, register node, declare service) require an `X-API-Key` header. The value must match `INFRA_API_KEY`.
+
+```bash
+curl -X POST https://your-control-plane/deploy \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key" \
+  -d '{"service": "api", "version": "latest"}'
+```
+
+Requests missing the header or supplying the wrong key receive a `401 Unauthorized` response. Read endpoints such as `GET /health` do not require authentication.
+
+<Tip>
+  In production, place the control plane behind a reverse proxy (nginx, Caddy)
+  with TLS termination. The `X-API-Key` header is transmitted in plain text over
+  HTTP, so HTTPS is required to prevent credential interception.
+</Tip>

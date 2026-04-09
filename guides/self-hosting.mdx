@@ -1,0 +1,247 @@
+---
+title: "Self-hosting"
+description: "Run Heimdall's control plane and agents on your own infrastructure, from a quick dev setup to a production systemd deployment."
+---
+
+Heimdall runs entirely on your own hardware. There is no cloud dependency. This page covers system requirements, the two ways to start the stack, and how to configure it for production.
+
+## System requirements
+
+| Component     | Requirement                                        |
+|---------------|----------------------------------------------------|
+| Python        | 3.11 or later (3.14 tested via Nix dev shell)      |
+| Nix           | Any recent version with flakes enabled             |
+| tmux          | Required by `start.sh` and `start-agent.sh`        |
+| uv            | Recommended for Python dependency management       |
+
+Enable Nix flakes if you have not already:
+
+```bash
+mkdir -p ~/.config/nix
+echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
+```
+
+## Install dependencies
+
+Clone the repository and install Python dependencies:
+
+```bash
+git clone https://github.com/Blazzzeee/heimdall_py
+cd heimdall_py
+cp .env.example .env   # edit with your values
+```
+
+<Tabs>
+  <Tab title="Nix dev shell (recommended)">
+    The project's `flake.nix` provides a dev shell with Python 3.14, `uv`, `tmux`, and `tailscale`:
+
+    ```bash
+    nix develop
+    uv sync          # install Python dependencies into .venv
+    ```
+
+    You are now inside a shell with all required tools on `PATH`.
+  </Tab>
+  <Tab title="Plain Python">
+    Install dependencies directly with pip or uv outside of Nix:
+
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+    ```
+  </Tab>
+</Tabs>
+
+## Configuration
+
+All configuration is read from environment variables. Copy `.env.example` and fill in your values:
+
+```bash
+INFRA_API_KEY=change-me
+INFRA_API_URL=http://localhost:8000
+HEIMDALL_ENV=dev
+HEIMDALL_ALLOW_DEFAULTS=1
+HEIMDALL_AGENT_DISABLE_BG=0
+FAIL_THRESHOLD=3
+WEBHOOK_TTL_SECONDS=60
+MONITOR_INTERVAL_SECONDS=5
+HEARTBEAT_TIMEOUT_SECONDS=2
+```
+
+| Variable                    | Description                                                                              |
+|-----------------------------|------------------------------------------------------------------------------------------|
+| `INFRA_API_KEY`             | Shared secret for API authentication and HMAC webhook signing.                           |
+| `INFRA_API_URL`             | Base URL the agent uses to deliver webhooks to the control plane.                        |
+| `HEIMDALL_ENV`              | Set to `prod` in production.                                                             |
+| `HEIMDALL_ALLOW_DEFAULTS`   | Set to `0` in production to disable fallback default values.                             |
+| `HEIMDALL_AGENT_DISABLE_BG` | Set to `1` to disable background health-check and log-flush tasks (useful for testing).  |
+| `FAIL_THRESHOLD`            | Number of consecutive missed heartbeats before a node is marked `OFFLINE`.               |
+| `MONITOR_INTERVAL_SECONDS`  | How often the control plane polls node heartbeats.                                       |
+| `HEARTBEAT_TIMEOUT_SECONDS` | HTTP timeout when the control plane checks a node's `/heartbeat` endpoint.               |
+
+## Running for development
+
+`start.sh` launches the full stack — control plane, agent, and Discord bot — in a single tmux session:
+
+```bash
+./start.sh
+```
+
+The script:
+1. Kills any processes on ports 8000, 8001, and 5000.
+2. Starts the control plane (`uvicorn api:app`) in a tmux window named `control`.
+3. Registers a `local-agent` node in the database.
+4. In non-production mode, registers `service-1` (api_service example) and `worker-1` (worker_service example).
+5. Starts the agent (`uvicorn main:app`) in a window named `agent`.
+6. Starts the Discord bot in a window named `bot`.
+7. Opens a `logs` window with split panes tailing `api.log`, `node.log`, and `bot.log`.
+
+Attach to the session at any time:
+
+```bash
+tmux attach -t heimdall
+```
+
+Stop everything:
+
+```bash
+tmux kill-session -t heimdall
+```
+
+To run only the agent (on a node that does not host the control plane), use `start-agent.sh`:
+
+```bash
+INFRA_API_KEY=your-secret-key \
+INFRA_API_URL=http://<control-plane-host>:8000 \
+./start-agent.sh
+```
+
+## Production deployment
+
+### Using systemd (recommended)
+
+The `systemd/` directory contains user-level service units for both the control plane and the agent. They wrap the tmux scripts so that systemd tracks process lifetime without requiring a root service.
+
+```ini systemd/heimdall.service
+[Unit]
+Description=Heimdall Control Plane (tmux wrapper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/heimdall_py
+EnvironmentFile=-%h/heimdall_py/.env
+Environment=PATH=/usr/bin:/bin:/usr/sbin:/sbin
+ExecStart=/bin/bash -lc "%h/heimdall_py/start.sh"
+ExecStop=/usr/bin/tmux kill-session -t heimdall
+RemainAfterExit=yes
+KillMode=none
+
+[Install]
+WantedBy=default.target
+```
+
+```ini systemd/heimdall-agent.service
+[Unit]
+Description=Heimdall Agent (tmux wrapper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/heimdall_py
+EnvironmentFile=-%h/heimdall_py/.env
+Environment=PATH=/usr/bin:/bin:/usr/sbin:/sbin
+ExecStart=/bin/bash -lc "%h/heimdall_py/start-agent.sh"
+ExecStop=/usr/bin/tmux kill-session -t heimdall-agent
+RemainAfterExit=yes
+KillMode=none
+
+[Install]
+WantedBy=default.target
+```
+
+Install the units on each machine:
+
+<Steps>
+  <Step title="Symlink the unit files">
+    ```bash
+    mkdir -p ~/.config/systemd/user
+    ln -s /path/to/heimdall_py/systemd/heimdall.service \
+          ~/.config/systemd/user/heimdall.service
+    ln -s /path/to/heimdall_py/systemd/heimdall-agent.service \
+          ~/.config/systemd/user/heimdall-agent.service
+    ```
+  </Step>
+  <Step title="Enable linger so the service starts before login">
+    ```bash
+    sudo loginctl enable-linger "$USER"
+    ```
+  </Step>
+  <Step title="Enable and start the services">
+    ```bash
+    systemctl --user daemon-reload
+    systemctl --user enable --now heimdall.service
+    systemctl --user enable --now heimdall-agent.service
+    ```
+  </Step>
+</Steps>
+
+The units load `.env` from the repo root via `EnvironmentFile`. If your repo lives at a different path, update the `WorkingDirectory` and `EnvironmentFile` lines in each unit file.
+
+### Using cron (non-systemd)
+
+On headless servers without systemd user sessions, use `@reboot` cron jobs:
+
+```bash
+crontab -e
+```
+
+Add:
+
+```
+@reboot /bin/bash -lc '/home/user/heimdall_py/start-agent.sh' >> /home/user/heimdall_py/logs/agent.cron.log 2>&1
+@reboot /bin/bash -lc 'cd /home/user/heimdall_py && nix develop -c ./start.sh' >> /home/user/heimdall_py/logs/control.cron.log 2>&1
+```
+
+Verify with:
+
+```bash
+crontab -l
+```
+
+## Data and log storage
+
+**Database** — Heimdall uses SQLite. The database file `heimdall.db` is created automatically in the project directory when the control plane starts for the first time. `init_db()` runs all schema migrations on startup; you do not need to run any migration commands manually.
+
+**Service logs** — The agent writes each service's stdout to `logs/<service-name>.log` inside the project directory. The file is created automatically on first write. Logs are also batched and forwarded to the control plane via webhook every 5 seconds.
+
+**Control plane and agent logs** — `start.sh` directs uvicorn output to `logs/api.log` and `logs/node.log`.
+
+After a fresh start, the directory layout looks like this:
+
+```
+heimdall_py/
+├── heimdall.db          # SQLite database (auto-created)
+├── logs/
+│   ├── api.log          # control plane stdout
+│   ├── node.log         # agent stdout
+│   ├── bot.log          # Discord bot stdout
+│   └── <service>.log    # per-service logs written by the agent
+├── fastapi_agent/
+│   └── state.json       # agent process state (PIDs, health URLs)
+└── .env
+```
+
+## Production checklist
+
+<Check>Set `INFRA_API_KEY` to a strong random secret — not `change-me`.</Check>
+<Check>Set `HEIMDALL_ENV=prod` to disable development shortcuts.</Check>
+<Check>Set `HEIMDALL_ALLOW_DEFAULTS=0` to prevent fallback default values from masking misconfiguration.</Check>
+<Check>Make the control plane reachable from every agent host on the `INFRA_API_URL` you configured.</Check>
+<Check>Run an agent process on every node registered in the control plane.</Check>
+<Check>Verify all agents show `"status": "ONLINE"` in `GET /nodes` before deploying.</Check>
+<Check>Set `DISCORD_TOKEN` if you are using the Discord bot integration.</Check>
+<Check>Point `EnvironmentFile` in the systemd units to the correct path if the repo is not at `~/heimdall_py`.</Check>

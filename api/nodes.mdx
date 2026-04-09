@@ -1,0 +1,136 @@
+---
+title: "Nodes"
+description: "Register nodes with the control plane and list their current health status."
+---
+
+A node represents a remote host running the Heimdall agent. The control plane tracks each node's status by polling the agent's `/heartbeat` endpoint at a configurable interval. Nodes are referenced by name when declaring services and triggering deployments.
+
+## POST /nodes
+
+Register a new node or update an existing one. If a node with the same `name` or `uuid` already exists, its `host` and `name` are updated in place.
+
+**Authentication:** `X-API-Key` required.
+
+### Request body
+
+<ParamField body="name" type="string" required>
+  Display name for the node. Used to reference the node in service declarations and deploy requests (e.g., `"node-1"`).
+</ParamField>
+
+<ParamField body="uuid" type="string" required>
+  Unique identifier for the node. Must be stable across restarts (e.g., `"node-1-unique-id"`).
+</ParamField>
+
+<ParamField body="host" type="string" required>
+  Full base URL of the agent running on this node, including scheme and port (e.g., `"http://10.0.0.5:8001"`). The control plane uses this URL to reach the agent's endpoints.
+</ParamField>
+
+### Response
+
+<ResponseField name="status" type="string" required>
+  Always `"success"` on a successful registration or update.
+</ResponseField>
+
+<ResponseField name="message" type="string" required>
+  Human-readable confirmation. Indicates whether the node was newly registered or updated.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl -X POST http://localhost:8000/nodes \
+  -H "X-API-Key: your-infra-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "node-1",
+    "uuid": "node-1-unique-id",
+    "host": "http://10.0.0.5:8001"
+  }'
+```
+
+```json response
+{
+  "status": "success",
+  "message": "Node 'node-1' registered successfully."
+}
+```
+
+</CodeGroup>
+
+---
+
+## GET /nodes
+
+List all registered nodes with their current health status.
+
+**Authentication:** `X-API-Key` required.
+
+### Response
+
+Returns an array of node objects.
+
+<ResponseField name="name" type="string">
+  Display name of the node.
+</ResponseField>
+
+<ResponseField name="uuid" type="string">
+  Unique identifier of the node.
+</ResponseField>
+
+<ResponseField name="host" type="string">
+  Base URL of the agent on this node.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current health status. One of `ONLINE`, `OFFLINE`, or `UNKNOWN`.
+
+  - `ONLINE` — the agent responded to the most recent heartbeat check.
+  - `OFFLINE` — the agent has failed to respond more than `FAIL_THRESHOLD` consecutive times (default: 3).
+  - `UNKNOWN` — the node has never been checked or the check has not completed yet.
+</ResponseField>
+
+<ResponseField name="fail_count" type="integer">
+  Number of consecutive failed heartbeat checks. Resets to `0` on a successful check.
+</ResponseField>
+
+<ResponseField name="last_seen" type="string">
+  ISO 8601 timestamp of the last successful heartbeat, or `null` if the node has never been seen online.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl http://localhost:8000/nodes \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+```json response
+[
+  {
+    "name": "node-1",
+    "uuid": "node-1-unique-id",
+    "host": "http://10.0.0.5:8001",
+    "status": "ONLINE",
+    "fail_count": 0,
+    "last_seen": "2024-11-15T14:23:01.000000Z"
+  },
+  {
+    "name": "node-2",
+    "uuid": "node-2-unique-id",
+    "host": "http://10.0.0.6:8001",
+    "status": "OFFLINE",
+    "fail_count": 5,
+    "last_seen": "2024-11-15T13:58:44.000000Z"
+  }
+]
+```
+
+</CodeGroup>
+
+<Tip>
+  Use `status` and `fail_count` together to distinguish a node that just went offline from one that has been unreachable for a long time. Configure sensitivity with the `FAIL_THRESHOLD` and `MONITOR_INTERVAL_SECONDS` environment variables.
+</Tip>

@@ -1,0 +1,479 @@
+---
+title: "Services"
+description: "Declare services on nodes, and trigger deploy, teardown, rollback, and command operations."
+---
+
+A service is a workload bound to a specific node. Before you can deploy a service, you must declare it with `POST /services`. All mutation endpoints (`/deploy`, `/teardown`, `/rollback`, `/command`) are asynchronous — they return an `operation_id` you can poll at `GET /operations/{id}`.
+
+## POST /services
+
+Declare a service on a node. If the service already exists on that node, the declaration updates its metadata in place.
+
+When you provide a `flake`, the control plane calls the agent's `/inspect` endpoint to fetch the service manifest. Commands and the healthcheck URL from the manifest are stored automatically.
+
+**Authentication:** `X-API-Key` required.
+
+### Request body
+
+<ParamField body="service" type="string" required>
+  Service name (e.g., `"api"`). This name identifies the service in all subsequent API calls.
+</ParamField>
+
+<ParamField body="node_name" type="string" required>
+  Name of the target node as registered with `POST /nodes` (e.g., `"node-1"`).
+</ParamField>
+
+<ParamField body="repo_url" type="string">
+  Repository URL for the service (e.g., `"github:org/repo"`).
+</ParamField>
+
+<ParamField body="flake" type="string">
+  Nix flake reference used to locate the service (e.g., `"github:org/repo#api"`). When provided, the control plane fetches the manifest from the agent and stores available commands and the healthcheck URL.
+</ParamField>
+
+<ParamField body="triggered_by" type="string">
+  Attribution string recorded in the audit log (e.g., a username or CI job name).
+</ParamField>
+
+### Response
+
+<ResponseField name="status" type="string">
+  Always `"success"` on a successful declaration.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable confirmation.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl -X POST http://localhost:8000/services \
+  -H "X-API-Key: your-infra-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "api",
+    "node_name": "node-1",
+    "repo_url": "github:org/repo",
+    "flake": "github:org/repo#api",
+    "triggered_by": "alice"
+  }'
+```
+
+```json response
+{
+  "status": "success",
+  "message": "Service 'api' declared on node 'node-1'."
+}
+```
+
+</CodeGroup>
+
+---
+
+## GET /services
+
+List all declared services across all nodes.
+
+**Authentication:** `X-API-Key` required.
+
+### Response
+
+Returns an array of service summary objects.
+
+<ResponseField name="name" type="string">
+  Service name.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Last known service status reported by the agent (e.g., `"idle"`, `"healthy"`, `"failed"`).
+</ResponseField>
+
+<ResponseField name="node_name" type="string">
+  Name of the node this service is declared on.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl http://localhost:8000/services \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+```json response
+[
+  {
+    "name": "api",
+    "status": "healthy",
+    "node_name": "node-1"
+  },
+  {
+    "name": "worker",
+    "status": "idle",
+    "node_name": "node-2"
+  }
+]
+```
+
+</CodeGroup>
+
+---
+
+## GET /services/:service_name
+
+Get details for a single service by name.
+
+**Authentication:** `X-API-Key` required.
+
+### Path parameters
+
+<ParamField path="service_name" type="string" required>
+  The name of the service to retrieve (e.g., `"api"`).
+</ParamField>
+
+### Response
+
+<ResponseField name="name" type="string">
+  Service name.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Last known service status.
+</ResponseField>
+
+<ResponseField name="healthcheck_url" type="string">
+  URL used to verify the service is healthy, populated from the manifest when a `flake` was provided on declaration. May be `null`.
+</ResponseField>
+
+<ResponseField name="node" type="string">
+  Name of the node this service runs on.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl http://localhost:8000/services/api \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+```json response
+{
+  "name": "api",
+  "status": "healthy",
+  "healthcheck_url": "http://10.0.0.5:8080/health",
+  "node": "node-1"
+}
+```
+
+</CodeGroup>
+
+---
+
+## POST /deploy
+
+Deploy a service to its declared node. The service must already be declared with `POST /services` and must have a `flake` configured.
+
+Any existing `pending` or `running` operations for the same service are marked `failed` (superseded) before the new operation is created.
+
+**Authentication:** `X-API-Key` required.
+
+### Request body
+
+<ParamField body="service" type="string" required>
+  Name of the service to deploy. Must be declared first.
+</ParamField>
+
+<ParamField body="version" type="string" default="latest">
+  Version tag, branch, or commit to deploy.
+</ParamField>
+
+<ParamField body="node_name" type="string">
+  Override the target node. If omitted, the node from the service declaration is used.
+</ParamField>
+
+<ParamField body="triggered_by" type="string">
+  Attribution string recorded in the audit log.
+</ParamField>
+
+### Response
+
+<ResponseField name="operation_id" type="string">
+  UUID of the created operation. Poll `GET /operations/{operation_id}` to track progress.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Initial status of the operation. Either `"pending"` or `"failed"` (if the service has no deploy command in its manifest).
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable description of what was queued.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl -X POST http://localhost:8000/deploy \
+  -H "X-API-Key: your-infra-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "api",
+    "version": "v1.5.0",
+    "triggered_by": "alice"
+  }'
+```
+
+```json response
+{
+  "operation_id": "d3f1a2b4-7c8e-4f0d-9b1a-2c3d4e5f6789",
+  "status": "pending",
+  "message": "Deploy of api@v1.5.0 to node-1 queued."
+}
+```
+
+</CodeGroup>
+
+---
+
+## POST /deploy-all
+
+Queue a deployment for every declared service. Each service gets its own operation.
+
+**Authentication:** `X-API-Key` required.
+
+### Query parameters
+
+<ParamField query="triggered_by" type="string">
+  Attribution string recorded in the audit log for all created operations.
+</ParamField>
+
+### Response
+
+<ResponseField name="status" type="string">
+  Always `"success"`.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Summary of how many deployments were queued.
+</ResponseField>
+
+<ResponseField name="operation_ids" type="string[]">
+  Array of UUIDs for each created operation, in the same order as the services list.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl -X POST "http://localhost:8000/deploy-all?triggered_by=ci" \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+```json response
+{
+  "status": "success",
+  "message": "Queued 3 deployments.",
+  "operation_ids": [
+    "a1b2c3d4-...",
+    "e5f6a7b8-...",
+    "c9d0e1f2-..."
+  ]
+}
+```
+
+</CodeGroup>
+
+---
+
+## POST /teardown
+
+Stop and remove a running service. The service must be declared.
+
+**Authentication:** `X-API-Key` required.
+
+### Request body
+
+<ParamField body="service" type="string" required>
+  Name of the service to tear down.
+</ParamField>
+
+<ParamField body="triggered_by" type="string">
+  Attribution string recorded in the audit log.
+</ParamField>
+
+### Response
+
+<ResponseField name="operation_id" type="string">
+  UUID of the created operation.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Initial operation status: `"pending"` or `"failed"`.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable confirmation.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl -X POST http://localhost:8000/teardown \
+  -H "X-API-Key: your-infra-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "api",
+    "triggered_by": "alice"
+  }'
+```
+
+```json response
+{
+  "operation_id": "f7e6d5c4-...",
+  "status": "pending",
+  "message": "Teardown of api queued."
+}
+```
+
+</CodeGroup>
+
+---
+
+## POST /rollback
+
+Roll a service back to a previous version.
+
+**Authentication:** `X-API-Key` required.
+
+### Request body
+
+<ParamField body="service" type="string" required>
+  Name of the service to roll back.
+</ParamField>
+
+<ParamField body="target_version" type="string" required>
+  Version to roll back to (e.g., `"v1.4.1"`).
+</ParamField>
+
+<ParamField body="reason" type="string">
+  Human-readable reason for the rollback, recorded in the audit log.
+</ParamField>
+
+<ParamField body="triggered_by" type="string">
+  Attribution string recorded in the audit log.
+</ParamField>
+
+### Response
+
+<ResponseField name="operation_id" type="string">
+  UUID of the created operation.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Initial operation status.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable confirmation.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl -X POST http://localhost:8000/rollback \
+  -H "X-API-Key: your-infra-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "api",
+    "target_version": "v1.4.1",
+    "reason": "v1.5.0 causing elevated error rate",
+    "triggered_by": "alice"
+  }'
+```
+
+```json response
+{
+  "operation_id": "b3c4d5e6-...",
+  "status": "pending",
+  "message": "Rollback of api to v1.4.1 queued."
+}
+```
+
+</CodeGroup>
+
+---
+
+## POST /command
+
+Run a named command from the service's manifest (e.g., `"migrate"`, `"seed"`). The command must exist in the manifest's `commands` map for the service.
+
+**Authentication:** `X-API-Key` required.
+
+### Request body
+
+<ParamField body="service" type="string" required>
+  Name of the service whose manifest defines the command. The service must be declared.
+</ParamField>
+
+<ParamField body="command" type="string" required>
+  Name of the command to run as defined in the manifest (e.g., `"migrate"`).
+</ParamField>
+
+<ParamField body="node_name" type="string">
+  Override the target node. If omitted, the node from the service declaration is used.
+</ParamField>
+
+<ParamField body="triggered_by" type="string">
+  Attribution string recorded in the audit log.
+</ParamField>
+
+### Response
+
+<ResponseField name="operation_id" type="string">
+  UUID of the created operation.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Initial operation status: `"pending"` or `"failed"` (if the command is not found in the manifest).
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable confirmation.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl -X POST http://localhost:8000/command \
+  -H "X-API-Key: your-infra-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "api",
+    "command": "migrate",
+    "triggered_by": "alice"
+  }'
+```
+
+```json response
+{
+  "operation_id": "1a2b3c4d-...",
+  "status": "pending",
+  "message": "Command 'migrate' queued for api."
+}
+```
+
+</CodeGroup>

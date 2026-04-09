@@ -1,0 +1,95 @@
+---
+title: "API overview"
+description: "Base URL, authentication, and a complete endpoint index for the Heimdall control plane API."
+---
+
+The Heimdall control plane exposes a REST API over HTTP. All mutation endpoints are asynchronous — they return an `operation_id` immediately and execute in the background. Use `GET /operations/{id}` to poll for the result.
+
+## Base URL
+
+```
+http://localhost:8000
+```
+
+The control plane defaults to port `8000`. The port is set in `start.sh` via `CTRL_PORT` and passed to uvicorn at startup. Update `start.sh` or your deployment command to change it.
+
+## Authentication
+
+All endpoints (except `POST /webhook` and `GET /health`) require an `X-API-Key` header. The value must match the `INFRA_API_KEY` environment variable set on the control plane.
+
+```bash
+curl http://localhost:8000/nodes \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+<Warning>
+  Never commit `INFRA_API_KEY` to source control. Set it as a secret in your deployment environment.
+</Warning>
+
+If the key is missing or incorrect, the API returns `401 Unauthorized`:
+
+```json
+{"detail": "Invalid or missing API key."}
+```
+
+## Async operations
+
+Endpoints that trigger work on a node — `/deploy`, `/deploy-all`, `/teardown`, `/rollback`, and `/command` — return immediately with an `operation_id`. The actual work runs in a background task.
+
+```json
+{
+  "operation_id": "d3f1a2b4-7c8e-4f0d-9b1a-2c3d4e5f6789",
+  "status": "pending",
+  "message": "Deploy of api@latest to node-1 queued."
+}
+```
+
+Poll `GET /operations/{operation_id}` until `status` is `success` or `failed`:
+
+```bash
+curl http://localhost:8000/operations/d3f1a2b4-7c8e-4f0d-9b1a-2c3d4e5f6789 \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+Operation IDs are UUID v4 strings generated per request.
+
+## Endpoint index
+
+| Method | Path | Description | Auth required |
+|--------|------|-------------|---------------|
+| `GET` | `/health` | Control plane health check | No |
+| `POST` | `/nodes` | Register or update a node | Yes |
+| `GET` | `/nodes` | List all registered nodes | Yes |
+| `POST` | `/services` | Declare a service on a node | Yes |
+| `GET` | `/services` | List all declared services | Yes |
+| `GET` | `/services/{service_name}` | Get details for a service | Yes |
+| `POST` | `/deploy` | Deploy a service | Yes |
+| `POST` | `/deploy-all` | Bulk deploy all services | Yes |
+| `POST` | `/teardown` | Tear down a service | Yes |
+| `POST` | `/rollback` | Roll back a service to a prior version | Yes |
+| `POST` | `/command` | Run a manifest command on a service | Yes |
+| `GET` | `/operations` | List recent operations | Yes |
+| `GET` | `/operations/audit` | Audit log of all operations | Yes |
+| `GET` | `/operations/{operation_id}` | Get operation status by ID | Yes |
+| `POST` | `/webhook` | Ingest a signed agent webhook event | HMAC |
+
+## Request tracing
+
+Every response includes an `X-Request-ID` header. You can supply your own by sending `X-Request-ID` in the request; otherwise the control plane generates a UUID automatically. Use this ID to correlate logs.
+
+## Endpoint groups
+
+<CardGroup cols={2}>
+  <Card title="Nodes" icon="server" href="/api/nodes">
+    Register nodes and list their current health status.
+  </Card>
+  <Card title="Services" icon="cube" href="/api/services">
+    Declare services and trigger deploy, teardown, rollback, and command operations.
+  </Card>
+  <Card title="Operations" icon="clock" href="/api/operations">
+    Poll operation status and query the audit log.
+  </Card>
+  <Card title="Webhook" icon="webhook" href="/api/webhook">
+    HMAC-signed event ingestion endpoint for agents.
+  </Card>
+</CardGroup>

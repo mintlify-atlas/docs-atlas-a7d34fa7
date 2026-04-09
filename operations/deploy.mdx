@@ -1,0 +1,156 @@
+---
+title: "Deploying services"
+description: "Deploy Nix-flake-defined services to nodes, track operation status, and audit every deployment."
+---
+
+<Note>
+  A service must be declared before you can deploy it. Call `POST /services` with a Nix flake reference
+  and a target node first. Heimdall reads the manifest from the flake to discover commands and the
+  health-check URL — without this step the deploy endpoint will return a 400.
+</Note>
+
+## How deployment works
+
+<Steps>
+  <Step title="Submit a deploy request">
+    You send `POST /deploy` with the service name, the target version, and optionally a `node_name`.
+    If you omit `node_name`, Heimdall resolves it from the declared service record.
+  </Step>
+  <Step title="Control plane creates an operation">
+    Heimdall looks up the `ServiceInstance`, resolves the flake reference and the `deploy` command
+    from the Nix manifest, then writes an `Operation` row with status `pending`. Any earlier
+    `pending` or `running` operations for the same service are immediately marked `failed`
+    (`"Superseded by new deployment."`).
+  </Step>
+  <Step title="Control plane dispatches to the agent">
+    The control plane sends an HMAC-signed `POST /command` to the node agent. The request body
+    includes the `operation_id`, service name, resolved flake reference, and `healthcheck_url`.
+  </Step>
+  <Step title="Agent validates and starts the service">
+    The agent receives the command, verifies the HMAC signature, then runs
+    `nix flake show <flake_ref>` to validate the flake. If validation passes, it spawns
+    `nix run <flake>`, records the PID, and immediately sends a `booting` status webhook back to
+    the control plane.
+  </Step>
+  <Step title="Agent reports health status">
+    Every 5 seconds the agent's health-check loop checks the PID and the `healthcheck_url`
+    (if one is configured). When the status changes it sends a `POST /webhook` with
+    `{"type": "status", "service": "...", "status": "healthy|dead|failed"}`.
+  </Step>
+  <Step title="Control plane updates the operation">
+    The control plane receives the webhook and resolves the most recent `running` operation for
+    that service. A `healthy` report sets the operation to `success`; `dead` or `failed` sets it
+    to `failed`.
+  </Step>
+</Steps>
+
+## Deploying a service
+
+```bash
+curl -X POST http://localhost:8000/deploy \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"service": "api", "version": "latest"}'
+```
+
+### Request body
+
+| Field          | Type   | Required | Description                                                        |
+| -------------- | ------ | -------- | ------------------------------------------------------------------ |
+| `service`      | string | Yes      | Name of the declared service (e.g. `"api-gateway"`).              |
+| `version`      | string | No       | Version label to record. Defaults to `"latest"`.                  |
+| `node_name`    | string | No       | Target node name. Resolved automatically from the service record.  |
+| `triggered_by` | string | No       | Identifier of who triggered the deploy (appears in audit log).     |
+
+### Response
+
+```json
+{
+  "operation_id": "3f2e1b4c-8a7d-4e6f-b9c0-1d2e3f4a5b6c",
+  "status": "pending",
+  "message": "Deploy of api@latest to node-1 queued."
+}
+```
+
+## Polling for operation status
+
+Use `GET /operations/{operation_id}` to check progress after submitting a deploy.
+
+```bash
+curl http://localhost:8000/operations/3f2e1b4c-8a7d-4e6f-b9c0-1d2e3f4a5b6c \
+  -H "X-API-Key: your-api-key"
+```
+
+```json
+{
+  "id": "3f2e1b4c-8a7d-4e6f-b9c0-1d2e3f4a5b6c",
+  "type": "deploy",
+  "status": "success",
+  "service": "api",
+  "version": "latest",
+  "message": "Agent reported service is healthy.",
+  "started_at": 1744214400.0,
+  "finished_at": 1744214412.5,
+  "error": null
+}
+```
+
+### Operation status values
+
+| Status    | Meaning                                                                    |
+| --------- | -------------------------------------------------------------------------- |
+| `pending` | The deploy has been queued but the agent has not yet acknowledged it.      |
+| `running` | The control plane has dispatched the command; waiting for a status report. |
+| `success` | The agent reported the service is `healthy` or exited cleanly (`stopped`). |
+| `failed`  | The agent reported `dead` or `failed`, or the command could not dispatch.  |
+
+## Bulk deploy
+
+`POST /deploy-all` queues a deploy operation for every declared service across all nodes simultaneously. The response returns all operation IDs so you can poll each one individually.
+
+```bash
+curl -X POST "http://localhost:8000/deploy-all?triggered_by=admin" \
+  -H "X-API-Key: your-api-key"
+```
+
+```json
+{
+  "status": "success",
+  "message": "Queued 3 deployments.",
+  "operation_ids": [
+    "3f2e1b4c-8a7d-4e6f-b9c0-1d2e3f4a5b6c",
+    "7c8d9e0f-1a2b-3c4d-5e6f-7a8b9c0d1e2f",
+    "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  ]
+}
+```
+
+## Audit log
+
+`GET /operations/audit` returns the most recent operations in reverse chronological order. The default limit is 50; pass `?limit=N` to change it.
+
+```bash
+curl "http://localhost:8000/operations/audit?limit=10" \
+  -H "X-API-Key: your-api-key"
+```
+
+```json
+[
+  {
+    "id": "3f2e1b4c-8a7d-4e6f-b9c0-1d2e3f4a5b6c",
+    "type": "deploy",
+    "service": "api",
+    "status": "success",
+    "triggered_by": "alice",
+    "created_at": "2026-04-09T12:00:00",
+    "message": "Agent reported service is healthy."
+  }
+]
+```
+
+Every operation record captures `triggered_by` so you have a full trace of who deployed what and when.
+
+<Tip>
+  You can trigger deployments and check operation status directly from Discord using the Heimdall
+  bot. See the [Discord commands](/discord/commands) page for the full command list.
+</Tip>

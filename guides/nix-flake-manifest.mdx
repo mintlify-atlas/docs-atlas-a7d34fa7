@@ -1,0 +1,259 @@
+---
+title: "Nix flake manifests"
+description: "How to define the heimdall-manifest attribute in your Nix flake so Heimdall can deploy, health-check, and manage your service."
+---
+
+Every service Heimdall manages must be backed by a Nix flake that exposes a `heimdall-manifest` attribute. The manifest tells Heimdall two things: how to start (and stop) the service, and how to verify it is healthy.
+
+## Why the manifest matters
+
+Heimdall does not rely on convention or environment variables to discover how to run your service. Instead, when you declare a service with `POST /services`, the control plane calls the agent's `/inspect` endpoint, which evaluates `<flake>#heimdall-manifest` with `nix eval --json`. The result is stored in the database alongside the flake reference. Every subsequent deploy, teardown, or custom command looks up the relevant entry from that stored manifest.
+
+This means the manifest is the single source of truth for everything Heimdall does with your service.
+
+## Manifest structure
+
+```nix
+heimdall-manifest = {
+  commands = {
+    deploy   = "<nix store path or executable>";
+    teardown = "<nix store path or executable>";  # optional
+  };
+  healthcheck_url = "http://127.0.0.1:<port>/";  # optional for workers
+};
+```
+
+| Field             | Required | Description                                                                                   |
+|-------------------|----------|-----------------------------------------------------------------------------------------------|
+| `commands`        | Yes      | A set mapping command names to Nix store paths. The `deploy` key is required for deployments. |
+| `healthcheck_url` | No       | URL the agent polls every 5 seconds to determine if the service is healthy.                   |
+
+<Tip>
+Always include `healthcheck_url` for HTTP services. Without it, Heimdall marks a service healthy as soon as the process starts rather than waiting for it to serve traffic.
+</Tip>
+
+## Examples
+
+<Tabs>
+  <Tab title="Python API service">
+    The `api_service` example runs a minimal Python HTTP server on port 5000.
+
+    ```nix examples/api_service/flake.nix
+    {
+      description = "A dummy API service";
+
+      inputs = {
+        nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+        flake-utils.url = "github:numtide/flake-utils";
+      };
+
+      outputs = { self, nixpkgs, flake-utils }:
+        flake-utils.lib.eachDefaultSystem (system:
+          let
+            pkgs = nixpkgs.legacyPackages.${system};
+
+            # Native Python (no external dependencies required)
+            pythonEnv = pkgs.python3;
+
+            # A script to run the dummy API
+            run-script = pkgs.writeShellScriptBin "run-api" ''
+              export PORT="''${PORT:-5000}"
+              echo "Starting Dummy HTTP API on port $PORT..."
+              exec ${pythonEnv}/bin/python ${./main.py}
+            '';
+
+          in
+          {
+            packages.default = run-script;
+
+            apps.default = {
+              type = "app";
+              program = "${run-script}/bin/run-api";
+            };
+
+            devShells.default = pkgs.mkShell {
+              buildInputs = [ pythonEnv ];
+            };
+
+            # Heimdall Metadata
+            heimdall-manifest = {
+              commands = {
+                deploy = "${run-script}/bin/run-api";
+              };
+              healthcheck_url = "http://127.0.0.1:5000/";
+            };
+          }
+        );
+    }
+    ```
+
+    The `deploy` command points to the compiled Nix store path of the `run-api` shell script. When Heimdall deploys this service, the agent runs `nix run <flake>#default` using that path as the program.
+
+    The `healthcheck_url` is `http://127.0.0.1:5000/`. The agent polls this URL every 5 seconds and marks the service `healthy` once it returns HTTP 200.
+  </Tab>
+  <Tab title="Node.js service">
+    The `nodejs_service` example runs a Node.js HTTP server on port 3000.
+
+    ```nix examples/nodejs_service/flake.nix
+    {
+      description = "A minimal NodeJS service for Heimdall";
+
+      inputs = {
+        nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+        flake-utils.url = "github:numtide/flake-utils";
+      };
+
+      outputs = { self, nixpkgs, flake-utils }:
+        flake-utils.lib.eachDefaultSystem (system:
+          let
+            pkgs = nixpkgs.legacyPackages.${system};
+            nodejs = pkgs.nodejs;
+
+            run-script = pkgs.writeShellScriptBin "run-node" ''
+              export PORT="''${PORT:-3000}"
+              echo "Starting NodeJS Service on port $PORT..."
+              exec ${nodejs}/bin/node ${./index.js}
+            '';
+
+          in
+          {
+            packages.default = run-script;
+
+            apps.default = {
+              type = "app";
+              program = "${run-script}/bin/run-node";
+            };
+
+            devShells.default = pkgs.mkShell {
+              buildInputs = [ nodejs ];
+            };
+
+            # Heimdall Metadata
+            heimdall-manifest = {
+              commands = {
+                deploy = "${run-script}/bin/run-node";
+              };
+              healthcheck_url = "http://127.0.0.1:3000/";
+            };
+          }
+        );
+    }
+    ```
+  </Tab>
+  <Tab title="Background worker">
+    The `worker_service` example runs a Python background worker. Because it does not serve HTTP traffic, it omits `healthcheck_url`. Heimdall tracks it by process liveness only.
+
+    ```nix examples/worker_service/flake.nix
+    {
+      description = "A dummy background worker service";
+
+      inputs = {
+        nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+        flake-utils.url = "github:numtide/flake-utils";
+      };
+
+      outputs = { self, nixpkgs, flake-utils }:
+        flake-utils.lib.eachDefaultSystem (system:
+          let
+            pkgs = nixpkgs.legacyPackages.${system};
+
+            pythonEnv = pkgs.python3.withPackages (ps: with ps; [
+              # Add worker dependencies here if needed
+            ]);
+
+            run-script = pkgs.writeShellScriptBin "run-worker" ''
+              echo "Starting Dummy Worker Service..."
+              exec ${pythonEnv}/bin/python ${./main.py}
+            '';
+
+          in
+          {
+            packages.default = run-script;
+
+            apps.default = {
+              type = "app";
+              program = "${run-script}/bin/run-worker";
+            };
+
+            devShells.default = pkgs.mkShell {
+              buildInputs = [ pythonEnv ];
+            };
+
+            heimdall-manifest = {
+              commands = {
+                deploy = "${run-script}/bin/run-worker";
+              };
+            };
+          }
+        );
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## How Heimdall reads the manifest
+
+When you call `POST /services` with a `flake` reference, the control plane forwards the flake to the agent's `/inspect` endpoint:
+
+```python api.py
+inspection = await send_agent_inspect(node.host, req.flake)
+if inspection.get("status") == "success":
+    manifest = inspection.get("manifest", {})
+    manifest_commands = manifest.get("commands")
+    manifest_healthcheck = manifest.get("healthcheck_url")
+```
+
+The agent evaluates the manifest by running:
+
+```bash
+nix eval <flake>#heimdall-manifest --json
+```
+
+Because `heimdall-manifest` is nested under a system attribute (e.g., `x86_64-linux`) when using `flake-utils.lib.eachDefaultSystem`, the agent resolves the current system automatically and unwraps the inner object before returning it.
+
+The resolved manifest is stored in the `ServiceInstance` database row. On every deploy, Heimdall calls `resolve_command_flake` to look up the right command:
+
+```python api.py
+def resolve_command_flake(svc: ServiceInstance, command_name: str):
+    commands = svc.commands or {}
+    if command_name not in commands:
+        return None, None, f"Command '{command_name}' is not supported by the manifest."
+    command_value = commands[command_name]
+    base_ref = svc.flake.split("#")[0]
+    if any(sep in command_value for sep in (":", "/", "#")):
+        return command_value, "flake", None
+    return f"{base_ref}#{command_value}", "flake", None
+```
+
+If the command value already contains a path separator or `#`, it is used verbatim as a flake reference. Otherwise, the value is appended to the base flake reference as a fragment.
+
+## Adding a teardown command
+
+To support `POST /teardown`, add a `teardown` key to `commands`:
+
+```nix
+heimdall-manifest = {
+  commands = {
+    deploy   = "${run-script}/bin/run-api";
+    teardown = "${teardown-script}/bin/teardown-api";
+  };
+  healthcheck_url = "http://127.0.0.1:5000/";
+};
+```
+
+Any command name you add here can be invoked through `POST /command` with `"command": "<name>"`. Use descriptive names like `migrate`, `seed`, or `backup` for one-off tasks.
+
+## Flake reference formats
+
+The `flake` field you pass to `POST /services` accepts any format that `nix eval` understands.
+
+<Warning>
+The `path:` prefix is required for local directory references passed to the agent. A bare filesystem path like `/home/user/myservice` may not resolve correctly depending on the agent's working directory. Always use `path:/home/user/myservice` for absolute local paths.
+</Warning>
+
+| Format | Example |
+|--------|---------|
+| Local path | `path:/home/user/myservice` |
+| GitHub | `github:owner/repo` |
+| GitHub with ref | `github:owner/repo/main` |
+| With fragment | `github:owner/repo#myattr` |

@@ -1,80 +1,192 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quick Start"
+description: "Get Heimdall running locally in minutes — control plane, node agent, and Discord bot all wired together."
 ---
 
-## Get started in three steps
+## Prerequisites
 
-Get your documentation site running locally and make your first customization.
+Before you begin, make sure you have the following installed:
 
-### Step 1: Set up your local environment
+- **Python virtual environment** — `python -m venv .venv` and activate it
+- **[Nix](https://nixos.org/)** with flakes enabled (`experimental-features = nix-command flakes` in your Nix config)
+- **tmux** — required by the launch scripts to manage processes
+- **git**
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<Steps>
 
-### Step 2: Deploy your changes
+<Step title="Clone the repository">
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```bash
+git clone https://github.com/Blazzzeee/heimdall_py.git
+cd heimdall_py
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+</Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+<Step title="Enter the dev shell">
 
-### Step 3: Go live
+The Nix flake provides a fully reproducible shell with all system-level dependencies pinned. Choose whichever method fits your workflow:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+<CodeGroup>
+
+```bash nix develop
+nix develop
+```
+
+```bash direnv allow
+direnv allow
+```
+
+</CodeGroup>
+
+<Tip>
+  If you use direnv, the shell activates automatically every time you `cd` into
+  the project directory. Run `direnv allow` once after cloning.
+</Tip>
+
+</Step>
+
+<Step title="Install Python dependencies">
+
+```bash
+pip install -r requirements.txt
+```
+
+This installs FastAPI, Uvicorn, SQLAlchemy, httpx, discord.py, and all other runtime and test dependencies.
+
+</Step>
+
+<Step title="Configure environment variables">
+
+Copy the example file and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+```ini .env.example
+INFRA_API_KEY=change-me
+INFRA_API_URL=http://localhost:8000
+HEIMDALL_ENV=dev
+HEIMDALL_ALLOW_DEFAULTS=1
+HEIMDALL_AGENT_DISABLE_BG=0
+FAIL_THRESHOLD=3
+WEBHOOK_TTL_SECONDS=60
+MONITOR_INTERVAL_SECONDS=5
+HEARTBEAT_TIMEOUT_SECONDS=2
+```
+
+| Variable                    | Description                                                                                                               |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `INFRA_API_KEY`             | Shared secret used to authenticate API requests and sign HMAC webhooks between agents and the control plane.             |
+| `INFRA_API_URL`             | Base URL of the control plane. Agents append `/webhook` to this to construct the event delivery URL.                      |
+| `HEIMDALL_ENV`              | Runtime environment. `dev` enables safe defaults; set to `prod` to require all secrets explicitly.                        |
+| `HEIMDALL_ALLOW_DEFAULTS`   | When `1`, missing secrets in `dev`/`test` fall back to built-in defaults with a warning instead of raising an error.      |
+| `HEIMDALL_AGENT_DISABLE_BG` | Set to `1` to disable the agent's background health-check and log-flush tasks. Useful for isolated testing.               |
+| `FAIL_THRESHOLD`            | Number of consecutive failed heartbeat polls before a node is marked `OFFLINE`.                                           |
+| `WEBHOOK_TTL_SECONDS`       | Maximum age (in seconds) of a signed webhook timestamp. Requests outside this window are rejected as replays.             |
+| `MONITOR_INTERVAL_SECONDS`  | How often (in seconds) the control plane polls node heartbeats.                                                           |
+| `HEARTBEAT_TIMEOUT_SECONDS` | HTTP timeout for each heartbeat request from the control plane to an agent node.                                          |
+
+<Warning>
+  `INFRA_API_KEY` is required by both `start.sh` and `start-agent.sh`. The
+  scripts will exit immediately if it is not set. Do not use the placeholder
+  value `change-me` in any environment exposed to a network.
+</Warning>
+
+</Step>
+
+<Step title="Start the control plane">
+
+```bash
+chmod +x ./start.sh && ./start.sh && tmux attach -t heimdall
+```
+
+The script will:
+
+1. Kill any processes already bound to ports `8000`, `8001`, and `5000`
+2. Start a tmux session named `heimdall` with four windows: `control`, `agent`, `bot`, and `logs`
+3. Launch the FastAPI control plane on port `8000`
+4. Bootstrap a `local-agent` node in the database
+5. Register two example services (`service-1`, `worker-1`) unless `PROD=true`
+6. Start the node agent on port `8001`
+7. Start the Discord bot
+
+<Note>
+  The session exposes the control plane at `http://localhost:8000` and the local
+  agent at `http://localhost:8001`. Use `tmux kill-session -t heimdall` to stop
+  everything.
+</Note>
+
+</Step>
+
+<Step title="Start a node agent on another machine (optional)">
+
+When operating a multi-machine setup, run only the agent on each worker node. Point it back at the control plane running on the primary host.
+
+```bash
+chmod +x ./start-agent.sh && ./start-agent.sh && tmux attach -t heimdall-agent
+```
+
+Make sure `INFRA_API_URL` and `INFRA_API_KEY` in `.env` on the worker node match the control plane's address and shared secret.
+
+The agent starts on port `8001` by default. Override with `HEIMDALL_AGENT_PORT` if that port is taken.
+
+</Step>
+
+<Step title="Verify with a health check">
+
+Once the control plane is up, confirm it is responding:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expected response:
+
+```json
+{"status": "ok", "timestamp": 1712345678.123}
+```
+
+<Note>
+  If `curl` returns a connection error, check that the control plane window
+  inside tmux started without errors: `tmux attach -t heimdall` and switch to
+  the `control` window with `Ctrl-b 0`.
+</Note>
+
+</Step>
+
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card
+    title="Architecture overview"
+    icon="diagram-project"
+    href="/architecture/overview"
+  >
+    Understand how agents, the control plane, and the Discord bot fit together.
+  </Card>
+  <Card
+    title="Deploy your first service"
+    icon="rocket"
+    href="/operations/deploy"
+  >
+    Register a Nix-flake-backed service and watch Heimdall track its health.
+  </Card>
+  <Card
+    title="Set up the Discord bot"
+    icon="discord"
+    href="/discord/setup"
+  >
+    Connect ChatOps to your control plane for real-time commands and alerts.
+  </Card>
+  <Card
+    title="Nix flake manifests"
+    icon="snowflake"
+    href="/guides/nix-flake-manifest"
+  >
+    Learn how to write and publish the flake manifests Heimdall deploys.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

@@ -1,0 +1,156 @@
+---
+title: "Webhook"
+description: "HMAC-signed event ingestion endpoint for Heimdall agents."
+---
+
+<Note>
+  This endpoint is called by Heimdall agents, not by users directly. You do not need to interact with it unless you are building a custom agent or debugging agent-to-control-plane communication.
+</Note>
+
+## POST /webhook
+
+Ingest a signed webhook event from an agent. The control plane verifies the HMAC-SHA256 signature before processing the payload. Verified events update service status, resolve pending operations, or forward log output to the control plane stdout.
+
+**Authentication:** HMAC-SHA256 signature (not `X-API-Key`).
+
+### Required headers
+
+<ParamField header="X-Signature" type="string" required>
+  HMAC-SHA256 hex digest of the request body concatenated with the timestamp string. Computed as `HMAC-SHA256(body_bytes_as_utf8_string + x_timestamp_string)` using `INFRA_API_KEY` as the key.
+</ParamField>
+
+<ParamField header="X-Timestamp" type="string" required>
+  Unix timestamp as a decimal string (e.g., `"1731678181"`). The control plane rejects requests where the timestamp differs from the server's current time by more than `WEBHOOK_TTL_SECONDS` (default: 60 seconds) to prevent replay attacks.
+</ParamField>
+
+### Response
+
+```json
+{"status": "accepted"}
+```
+
+The control plane always returns `accepted` synchronously. Event processing happens after the response is sent.
+
+---
+
+## Signature computation
+
+The agent computes the signature as follows:
+
+```python
+import hashlib
+import hmac
+import time
+import json
+
+body = json.dumps(payload)          # JSON-encode the payload
+timestamp = str(int(time.time()))   # Unix timestamp as string
+message = body + timestamp          # Concatenate body string and timestamp string
+
+signature = hmac.new(
+    INFRA_API_KEY.encode("utf-8"),
+    message.encode("utf-8"),
+    hashlib.sha256,
+).hexdigest()
+```
+
+Then include both headers on the request:
+
+```bash
+curl -X POST http://localhost:8000/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Signature: <computed-hex-digest>" \
+  -H "X-Timestamp: <unix-timestamp>" \
+  -d '{"type": "status", "service": "api", "status": "healthy", "error": null}'
+```
+
+<Warning>
+  The signature covers both the body and the timestamp. Changing either one invalidates the signature. Always recompute both together.
+</Warning>
+
+---
+
+## Event types
+
+The control plane dispatches based on the `type` field in the JSON body.
+
+### node\_status
+
+Reports the running status of one or more services on the node. The control plane updates the `status` field on each matching `ServiceInstance` record.
+
+```json
+{
+  "type": "node_status",
+  "services": {
+    "api": {
+      "pid": 12345,
+      "status": "healthy"
+    },
+    "worker": {
+      "pid": 12346,
+      "status": "dead"
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `type` | Always `"node_status"`. |
+| `services` | Map of service name → `{ pid, status }`. Only services already declared in the control plane are updated. |
+
+### status
+
+Reports a status change for a single service. The control plane updates the matching `ServiceInstance` and resolves the most recent `running` operation for that service.
+
+```json
+{
+  "type": "status",
+  "service": "api",
+  "status": "healthy",
+  "error": null
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `type` | Always `"status"`. |
+| `service` | Service name. Must match a declared service. |
+| `status` | New status. `"healthy"` or `"stopped"` → operation set to `success`. `"failed"` or `"dead"` → operation set to `failed`. |
+| `error` | Optional error string. Stored on the operation when status is `"failed"` or `"dead"`. |
+
+### logs\_batch
+
+Sends a batch of log lines from the agent. The control plane prints each line to its stdout in the format `[Remote {service} | {stream}] {log}`.
+
+```json
+{
+  "type": "logs_batch",
+  "logs": [
+    {
+      "service": "api",
+      "stream": "stdout",
+      "log": "Server listening on :8080"
+    },
+    {
+      "service": "api",
+      "stream": "stderr",
+      "log": "WARN: deprecated config key detected"
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `type` | Always `"logs_batch"`. |
+| `logs` | Array of log entries. Each entry has `service`, `stream` (`"stdout"` or `"stderr"`), and `log` (the log line string). |
+
+---
+
+## Error responses
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | `X-Timestamp` is missing, non-numeric, or older than `WEBHOOK_TTL_SECONDS`. |
+| `401 Unauthorized` | Signature does not match the computed HMAC. |

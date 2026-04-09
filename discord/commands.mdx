@@ -1,0 +1,269 @@
+---
+title: "Bot commands"
+description: "Reference for every slash command exposed by the Heimdall Discord bot."
+---
+
+All commands are Discord slash commands registered globally on bot startup. Type `/` in any channel where the bot is present to see the full list with inline descriptions.
+
+## Status indicators
+
+The bot uses consistent emoji markers in all embeds:
+
+**Operation status**
+
+| Emoji | Status |
+|-------|--------|
+| ⏳ | `pending` — queued, not yet started |
+| 🔄 | `running` — currently executing |
+| ✅ | `success` — completed successfully |
+| ❌ | `failed` — completed with an error |
+| 🟡 | `booting` — service is starting up |
+| 🟢 | `healthy` — service is up and passing health checks |
+
+**Node status**
+
+| Emoji | Status |
+|-------|--------|
+| 🟢 | `ONLINE` |
+| 🔴 | `OFFLINE` |
+
+---
+
+## Command reference
+
+<AccordionGroup>
+
+  <Accordion title="Node management">
+
+    ### `/register-node`
+
+    Register a new infrastructure node (agent) with the control plane.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `name` | Yes | Display name for the node (e.g. `prod-eu-1`) |
+    | `node_id` | Yes | Unique identifier for the node (e.g. `prod-eu-1` or a UUID) |
+    | `host` | Yes | Agent host, IP, or full URL |
+
+    The `host` parameter is normalized automatically:
+    - Full URL passed as-is (`https://10.0.0.5:8001`)
+    - `host:port` gets `http://` prepended (`http://10.0.0.5:8001`)
+    - Bare hostname or IP gets `http://` prepended and `:8001` appended (`http://nixos:8001`)
+
+    **Response:** A confirmation message on success, or an error embed with troubleshooting hints if the control plane is unreachable.
+
+    ```
+    /register-node name:prod-eu-1 node_id:prod-eu-1 host:10.0.0.5
+    ```
+
+    ---
+
+    ### `/add-node`
+
+    Alias for `/register-node`. Accepts the same parameters and behaves identically.
+
+    ```
+    /add-node name:worker-1 node_id:worker-1 host:192.168.1.42
+    ```
+
+    ---
+
+    ### `/nodes`
+
+    List all registered nodes and their current online/offline status.
+
+    **Response:** An embed titled **🖥️ Registered Nodes (N)** with one field per node showing its display name and host address. Each node name is prefixed with 🟢 or 🔴 based on its reported status.
+
+    ```
+    /nodes
+    ```
+
+  </Accordion>
+
+  <Accordion title="Service management">
+
+    ### `/register`
+
+    Declare a new service configuration on a node. This tells the control plane which node owns the service and, optionally, which Nix flake defines it.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `service` | Yes | Service name (e.g. `api`, `worker-1`) |
+    | `node_name` | Yes | Name of the node that will run this service |
+    | `flake` | No | Nix flake reference (e.g. `path:/srv/flakes/api` or `github:org/repo`) |
+
+    **Response:** A success message followed immediately by a live health monitor embed for the newly registered service (see [`/health`](#health)).
+
+    ```
+    /register service:api node_name:prod-eu-1 flake:path:/srv/flakes/api
+    ```
+
+    ---
+
+    ### `/services`
+
+    List all registered services and their current status.
+
+    **Response:** An embed titled **📦 Registered Services (N)** with one field per service. Each field shows the node name and current status, prefixed with the matching status emoji.
+
+    ```
+    /services
+    ```
+
+  </Accordion>
+
+  <Accordion title="Deployment operations">
+
+    ### `/deploy`
+
+    Trigger a deployment for a service. The bot polls the resulting operation every 2 seconds and updates the embed in real time as the status transitions from `pending` → `running` → `success` or `failed`.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `service` | Yes | Name of the service to deploy |
+    | `node_name` | No | Override the node registered for this service |
+    | `version` | No | Version tag or branch to deploy (defaults to `latest`) |
+
+    **Response:** An initial **⏳ Deploy queued** embed that updates live. On completion, the final embed shows the operation type, status, version deployed, deployment URL (if available), and any error message. A live health monitor is then started for the service.
+
+    ```
+    /deploy service:api
+    /deploy service:api version:v1.4.2
+    /deploy service:api node_name:prod-eu-2 version:main
+    ```
+
+    ---
+
+    ### `/deploy-all`
+
+    Trigger a deployment for every registered service at once.
+
+    **Response:** A **🚀 Bulk Deploy Initiated** embed showing how many deployments were queued. Individual operation IDs are not tracked live — use `/status` to check each one.
+
+    ```
+    /deploy-all
+    ```
+
+    ---
+
+    ### `/teardown`
+
+    Decommission a service from its node. The bot polls the operation and posts the final result embed.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `service` | Yes | Name of the service to tear down |
+
+    **Response:** An initial **🗑️ Teardown — {service}** embed followed by a final operation embed when the operation completes.
+
+    ```
+    /teardown service:worker-1
+    ```
+
+    ---
+
+    ### `/rollback`
+
+    Roll back a service to a specific previous version.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `service` | Yes | Name of the service to roll back |
+    | `target_version` | Yes | Version to roll back to (e.g. `v1.3.0`) |
+    | `reason` | No | Optional reason recorded in the audit log |
+
+    **Response:** An initial **⏳ Rollback queued** embed, then a final operation embed when the rollback completes.
+
+    ```
+    /rollback service:api target_version:v1.3.0
+    /rollback service:api target_version:v1.3.0 reason:regression in v1.4.0
+    ```
+
+    ---
+
+    ### `/command`
+
+    Run a manifest-defined command for a service (e.g. a database migration or cache flush defined in the Nix flake manifest).
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `service` | Yes | Name of the service |
+    | `command` | Yes | Name of the manifest command to run |
+    | `node_name` | No | Override the node registered for this service |
+
+    **Response:** An initial **⏳ Command queued** embed that updates live, then a final operation embed showing the result.
+
+    ```
+    /command service:api command:migrate
+    /command service:api command:flush-cache node_name:prod-eu-2
+    ```
+
+  </Accordion>
+
+  <Accordion title="Monitoring">
+
+    ### `/status`
+
+    Fetch the current state of any operation by its ID.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `operation_id` | Yes | The operation ID (shown in the footer of any operation embed as `op_id: …`) |
+
+    **Response:** An operation embed with the current status, service name, version, deployment URL, and any error — identical in format to the live-updating embeds from `/deploy` and `/rollback`.
+
+    ```
+    /status operation_id:a1b2c3d4-e5f6-7890-abcd-ef1234567890
+    ```
+
+    ---
+
+    ### `/health`
+
+    Start a live health monitor. The embed refreshes every 5 seconds for as long as the bot is running.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `service` | No | Service name to monitor. Omit to monitor the control plane itself. |
+
+    **When monitoring a service:** The embed shows the service status (`healthy`, `booting`, or other), the node it runs on, and its healthcheck URL.
+
+    **When monitoring the control plane (no `service` given):** The embed shows the API status (`ok` or error) and the configured `INFRA_API_URL`.
+
+    If the control plane becomes unreachable, the embed switches to a 🔴 **Unreachable** state with the connection error.
+
+    ```
+    /health
+    /health service:api
+    ```
+
+    ---
+
+    ### `/audit`
+
+    View recent infrastructure audit log entries. Each entry shows the operation type, the service it affected, who triggered it, the time, and the final status.
+
+    | Parameter | Required | Description |
+    |-----------|----------|-------------|
+    | `limit` | No | Number of log entries to show (defaults to `15`, maximum `50`) |
+
+    **Response:** A **🛡️ Infrastructure Audit Logs** embed with one field per log entry in reverse-chronological order. Each entry is prefixed with the status emoji for that operation.
+
+    ```
+    /audit
+    /audit limit:50
+    ```
+
+  </Accordion>
+
+</AccordionGroup>
+
+---
+
+## Error handling
+
+When a command fails to reach the control plane, the bot responds with a **❌ Heimdall API — Error** embed. If the error message contains `Connect call failed` or `Cannot connect to host`, the embed includes a troubleshooting hint:
+
+> The Control Plane seems offline. Ensure `bash start.sh` is running on port 8000.
+
+All errors display the raw exception message in a code block for easier debugging.

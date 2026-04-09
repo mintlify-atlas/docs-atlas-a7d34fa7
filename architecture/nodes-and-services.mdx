@@ -1,0 +1,157 @@
+---
+title: "Nodes and services"
+description: "Data models for Node, ServiceInstance, and Operation — field definitions, status values, and deployment lifecycle."
+---
+
+Three SQLAlchemy models underpin everything Heimdall tracks: `Node`, `ServiceInstance`, and `Operation`. Understanding them helps you interpret API responses, debug failed deployments, and reason about what the control plane is doing at any moment.
+
+## Node
+
+A `Node` represents one managed host — a machine running the node agent.
+
+| Field        | Type      | Description                                                              |
+| ------------ | --------- | ------------------------------------------------------------------------ |
+| `id`         | `String`  | Primary key, UUID generated on insert                                    |
+| `name`       | `String`  | Human-readable identifier, must be unique (e.g. `prod-eu-1`)            |
+| `uuid`       | `String`  | Secondary unique identifier, distinct from the row `id`                  |
+| `host`       | `String`  | Base URL the control plane uses to reach the agent (e.g. `http://10.0.0.5:8001`) |
+| `status`     | `String`  | `ONLINE`, `OFFLINE`, or `UNKNOWN` (default)                              |
+| `fail_count` | `Integer` | Consecutive failed heartbeat checks; resets to `0` on success            |
+| `last_seen`  | `String`  | ISO 8601 timestamp of the last successful heartbeat                      |
+| `created_at` | `DateTime`| Row creation timestamp                                                   |
+
+The background monitor increments `fail_count` for each failed `/heartbeat` poll. Once `fail_count` reaches `FAIL_THRESHOLD` (default `3`), `status` moves to `"OFFLINE"`. A single successful heartbeat resets both `fail_count` and `status` to `"ONLINE"`.
+
+## ServiceInstance
+
+A `ServiceInstance` is one service running (or declared to run) on a specific node. It stores everything the control plane needs to deploy and monitor the service.
+
+| Field             | Type      | Description                                                                    |
+| ----------------- | --------- | ------------------------------------------------------------------------------ |
+| `id`              | `String`  | Primary key, UUID generated on insert                                          |
+| `node_id`         | `String`  | Foreign key → `nodes.id`                                                      |
+| `name`            | `String`  | Service name (e.g. `api`, `worker`)                                           |
+| `service_uuid`    | `String`  | Secondary identifier, typically set to the service name on creation            |
+| `repo_url`        | `String`  | Source repository URL (e.g. `github:org/repo`)                                |
+| `flake`           | `String`  | Nix flake reference used to build and run the service (e.g. `github:org/repo#api`) |
+| `commands`        | `JSON`    | Map of command names to flake output names (e.g. `{"deploy": "apps.api"}`)    |
+| `healthcheck_url` | `String`  | HTTP URL polled by the agent to determine if the service is healthy            |
+| `triggered_by`    | `String`  | Who last declared or updated this service (audit field)                        |
+| `status`          | `String`  | Last status reported by the agent. Default `idle`; agent sets `booting`, `healthy`, `unhealthy`, `dead`, `stopped`, or `failed` |
+| `created_at`      | `DateTime`| Row creation timestamp                                                         |
+
+The `commands` JSON object maps well-known command names (`deploy`, `teardown`, `rollback`) to Nix flake output references. When the control plane resolves a command, it calls `resolve_command_flake()` to build the final `nix run`-compatible reference sent to the agent.
+
+## Operation
+
+An `Operation` is a single lifecycle event tied to a service. Every call to `/deploy`, `/teardown`, `/rollback`, or `/command` creates one.
+
+| Field            | Type       | Description                                                                  |
+| ---------------- | ---------- | ---------------------------------------------------------------------------- |
+| `id`             | `String`   | Primary key, UUID generated on insert                                        |
+| `service_id`     | `String`   | Foreign key → `service_instances.id` (nullable for ad-hoc ops)              |
+| `type`           | `String`   | `deploy`, `teardown`, `rollback`, or `command`                               |
+| `status`         | `String`   | `pending`, `running`, `success`, or `failed` (default `pending`)            |
+| `service_name`   | `String`   | Denormalised service name for fast access without a join                     |
+| `version`        | `String`   | Version string requested for this operation                                  |
+| `target_version` | `String`   | Target version for rollback operations                                       |
+| `message`        | `String`   | Human-readable status message                                                |
+| `error`          | `String`   | Error detail if the operation failed                                         |
+| `metadata_json`  | `JSON`     | Operation-specific metadata: `repo_url`, `flake`, `command_flake`, `healthcheck_url` |
+| `triggered_by`   | `String`   | Who initiated the operation (e.g. a Discord username)                        |
+| `started_at`     | `DateTime` | When the operation was queued                                                |
+| `finished_at`    | `DateTime` | When the operation resolved (success or failure)                             |
+| `created_at`     | `DateTime` | Row creation timestamp                                                       |
+
+## Relationships
+
+```
+Node
+└── ServiceInstance (many, cascade delete)
+    └── Operation (many, cascade delete)
+```
+
+One node has many service instances. One service instance has many operations. Deleting a node cascades to all its service instances and their operations.
+
+## Deployment lifecycle
+
+Here is what happens from the moment you call `POST /deploy` to the service being confirmed healthy.
+
+<Steps>
+  <Step title="Control plane creates an operation">
+    An `Operation` row is inserted with `status = "pending"` and
+    `type = "deploy"`. Any existing `pending` or `running` operations for the
+    same service are immediately marked `failed` with the message
+    `"Superseded by new deployment."` to avoid ambiguity.
+  </Step>
+  <Step title="Control plane resolves the command">
+    `resolve_command_flake()` looks up the `"deploy"` key in the service's
+    `commands` JSON and constructs the full flake reference (e.g.
+    `github:org/repo#apps.api`) to pass to the agent.
+  </Step>
+  <Step title="Control plane sends the command to the agent">
+    A signed `POST {node.host}/command` request is sent with the operation ID,
+    service name, flake reference, and optional `healthcheck_url`. The request
+    itself is HMAC-signed so the agent can verify it came from the control plane.
+  </Step>
+  <Step title="Agent starts nix run">
+    The agent validates the flake with `nix flake show`, then spawns `nix run
+    {flake}` as a subprocess. It records the PID in `service_state` and
+    immediately sends a `status` webhook with `status = "booting"`.
+  </Step>
+  <Step title="Agent monitors health">
+    Every 5 seconds the health check loop checks the process PID (via
+    `os.kill(pid, 0)`) and, if a `healthcheck_url` was provided, sends an HTTP
+    GET to it. Status transitions (`booting → healthy`, `healthy → dead`) are
+    sent to the control plane as `status` webhooks immediately on change.
+  </Step>
+  <Step title="Control plane resolves the operation">
+    When the control plane receives a `status` event for the service, it finds
+    the most recent `running` operation and updates it: `healthy` → `success`;
+    `failed` or `dead` → `failed` with the error detail from the agent.
+  </Step>
+</Steps>
+
+## Failure scenarios
+
+<AccordionGroup>
+  <Accordion title="What happens when a node goes offline?">
+    The control plane's background monitor polls each node's `/heartbeat`
+    endpoint every `MONITOR_INTERVAL_SECONDS` (default `5`s). Each failure
+    increments `fail_count`. Once `fail_count` reaches `FAIL_THRESHOLD`
+    (default `3`), the node's `status` is set to `"OFFLINE"`.
+
+    The node's services are **not** automatically marked failed or stopped —
+    the node itself is simply flagged as unreachable. Any in-progress
+    operations targeting that node will not receive a status update from the
+    agent and will remain in `running` or `pending` state until manually
+    resolved or until the node comes back online and the agent resumes sending
+    `status` events.
+
+    When the node recovers and a heartbeat succeeds, `fail_count` resets to
+    `0` and `status` returns to `"ONLINE"`.
+  </Accordion>
+  <Accordion title="What happens when a service fails?">
+    The agent detects failure in two ways: the process PID disappears
+    (`os.kill(pid, 0)` raises `OSError`), or the `healthcheck_url` returns a
+    non-`200` response. Either way, the agent immediately sends a `status`
+    webhook:
+
+    ```json
+    {
+      "type": "status",
+      "service": "api",
+      "status": "dead",
+      "error": "exit code 1"
+    }
+    ```
+
+    The control plane receives this, finds the most recent `running` operation
+    for the service, sets `operation.status = "failed"`, records the error
+    string, and sets `finished_at`. The `ServiceInstance.status` is also
+    updated to `"dead"`.
+
+    No automatic restart or rollback is triggered — you initiate recovery by
+    calling `POST /deploy` again or `POST /rollback` to a previous version.
+  </Accordion>
+</AccordionGroup>

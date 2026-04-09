@@ -1,0 +1,144 @@
+---
+title: "Teardown and rollback"
+description: "Decommission a service from a node or revert it to a previous version."
+---
+
+## Teardown
+
+Use teardown when you want to stop and decommission a service on its node. Heimdall resolves the
+`teardown` command from the service's Nix manifest and dispatches it to the agent via the same
+HMAC-signed `POST /command` flow used for deployments.
+
+Teardown is appropriate when:
+
+- You are retiring a service permanently from a node.
+- You need to stop a service before re-configuring it with a different flake.
+- You want a clean shutdown that goes through the manifest-defined teardown procedure.
+
+### Teardown request
+
+```bash
+curl -X POST http://localhost:8000/teardown \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"service": "api", "triggered_by": "alice"}'
+```
+
+#### Request body
+
+| Field          | Type   | Required | Description                                                        |
+| -------------- | ------ | -------- | ------------------------------------------------------------------ |
+| `service`      | string | Yes      | Name of the declared service to tear down.                         |
+| `triggered_by` | string | No       | Identifier of who initiated the teardown (appears in audit log).   |
+
+#### Response
+
+```json
+{
+  "operation_id": "c7d8e9f0-a1b2-3c4d-5e6f-7a8b9c0d1e2f",
+  "status": "pending",
+  "message": "Teardown of api queued."
+}
+```
+
+Poll `GET /operations/{operation_id}` to track progress, exactly as you would for a deployment.
+
+---
+
+## Rollback
+
+Use rollback when you need to revert a service to a known-good version after a bad deploy. Specify
+the exact version tag that the flake was pinned to at that time.
+
+<Warning>
+  Rollback requires the target version's Nix derivation to still be accessible — either in the
+  local Nix store on the node or in the upstream binary cache. If the closure has been garbage-
+  collected, the rollback will fail. Pin the versions you may need to roll back to before running
+  `nix-collect-garbage`.
+</Warning>
+
+### Rollback request
+
+```bash
+curl -X POST http://localhost:8000/rollback \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "api",
+    "target_version": "v1.4.1",
+    "reason": "hotfix",
+    "triggered_by": "alice"
+  }'
+```
+
+#### Request body
+
+| Field            | Type   | Required | Description                                                        |
+| ---------------- | ------ | -------- | ------------------------------------------------------------------ |
+| `service`        | string | Yes      | Name of the declared service to roll back.                         |
+| `target_version` | string | Yes      | Version label to roll back to (e.g. `"v1.4.1"`).                  |
+| `reason`         | string | No       | Free-text description of why the rollback is being performed.      |
+| `triggered_by`   | string | No       | Identifier of who initiated the rollback (appears in audit log).   |
+
+#### Response
+
+```json
+{
+  "operation_id": "b5c6d7e8-f9a0-1b2c-3d4e-5f6a7b8c9d0e",
+  "status": "pending",
+  "message": "Rollback of api to v1.4.1 queued."
+}
+```
+
+---
+
+## The `triggered_by` field
+
+Both teardown and rollback operations record `triggered_by` in the operation row. This field flows
+through to the audit log returned by `GET /operations/audit`, so you can trace every action back to
+the person or system that initiated it — whether that is a human username, a CI system identifier,
+or a Discord user handle.
+
+```json
+{
+  "id": "c7d8e9f0-a1b2-3c4d-5e6f-7a8b9c0d1e2f",
+  "type": "teardown",
+  "service": "api",
+  "status": "success",
+  "triggered_by": "alice",
+  "created_at": "2026-04-09T14:30:00",
+  "message": "Torn down api."
+}
+```
+
+---
+
+## Running custom manifest commands
+
+`POST /command` lets you run any command defined in the service's Nix manifest — not just the
+built-in `deploy` and `teardown` entries. This is useful for one-off tasks like database migrations,
+cache-warming, or smoke tests that are defined as named outputs in your flake.
+
+```bash
+curl -X POST http://localhost:8000/command \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "api",
+    "command": "migrate",
+    "triggered_by": "ci"
+  }'
+```
+
+#### Request body
+
+| Field          | Type   | Required | Description                                                                   |
+| -------------- | ------ | -------- | ----------------------------------------------------------------------------- |
+| `service`      | string | Yes      | Name of the declared service.                                                 |
+| `command`      | string | Yes      | Name of the manifest command to run (must be a key in the flake's `commands`).|
+| `node_name`    | string | No       | Target node name. Resolved from the service record if omitted.                |
+| `triggered_by` | string | No       | Identifier recorded in the audit log.                                         |
+
+The control plane resolves the command's flake output from the manifest, dispatches it to the agent,
+and tracks it as a `command` operation — so it appears in `GET /operations/audit` like any other
+action.

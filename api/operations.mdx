@@ -1,0 +1,299 @@
+---
+title: "Operations"
+description: "Track async operation status and query the audit log."
+---
+
+An operation is a record of an async action taken by the control plane — a deploy, teardown, rollback, or command. When you trigger any of these actions, the API returns an `operation_id` immediately. Use `GET /operations/{operation_id}` to poll progress until the operation reaches a terminal state.
+
+## Operation lifecycle
+
+```text
+pending → running → success
+                  → failed
+```
+
+- **pending** — queued, not yet started by the background worker.
+- **running** — the agent has received the instruction and is executing it.
+- **success** — the agent reported the service is healthy (or exited cleanly for teardown).
+- **failed** — the agent reported a failure, or the command was not found in the manifest.
+
+The transition from `running` to a terminal state is driven by a `status` event sent by the agent over the `/webhook` endpoint.
+
+## Polling pattern
+
+```bash
+# 1. Trigger a deploy
+curl -X POST http://localhost:8000/deploy \
+  -H "X-API-Key: your-infra-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"service": "api", "version": "latest"}'
+# → {"operation_id": "abc-123", "status": "pending", "message": "..."}
+
+# 2. Poll until done
+curl http://localhost:8000/operations/abc-123 \
+  -H "X-API-Key: your-infra-api-key"
+# → {"id": "abc-123", "status": "success", ...}
+```
+
+Poll at a reasonable interval (e.g., every 2–5 seconds). Stop when `status` is `success` or `failed`.
+
+---
+
+## GET /operations
+
+List recent operations, newest first.
+
+**Authentication:** `X-API-Key` required.
+
+### Query parameters
+
+<ParamField query="limit" type="integer" default="20">
+  Maximum number of operations to return.
+</ParamField>
+
+### Response
+
+<ResponseField name="operations" type="object[]">
+  Array of operation summary objects.
+
+  <Expandable title="operation fields">
+    <ResponseField name="id" type="string">
+      UUID of the operation.
+    </ResponseField>
+    <ResponseField name="type" type="string">
+      Type of operation: `"deploy"`, `"teardown"`, `"rollback"`, or `"command"`.
+    </ResponseField>
+    <ResponseField name="status" type="string">
+      Current status: `"pending"`, `"running"`, `"success"`, or `"failed"`.
+    </ResponseField>
+    <ResponseField name="service" type="string">
+      Name of the service this operation targets.
+    </ResponseField>
+    <ResponseField name="version" type="string">
+      Version deployed (deploy operations only). May be `null`.
+    </ResponseField>
+    <ResponseField name="target_version" type="string">
+      Target version for rollback operations. May be `null`.
+    </ResponseField>
+    <ResponseField name="message" type="string">
+      Human-readable status message.
+    </ResponseField>
+    <ResponseField name="error" type="string">
+      Error detail if `status` is `"failed"`. May be `null`.
+    </ResponseField>
+    <ResponseField name="started_at" type="number">
+      Unix timestamp (float) when the operation was created.
+    </ResponseField>
+    <ResponseField name="finished_at" type="number">
+      Unix timestamp (float) when the operation completed. `null` if still in progress.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="total" type="integer">
+  Total number of operations in the database (not just the returned page).
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl "http://localhost:8000/operations?limit=5" \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+```json response
+{
+  "operations": [
+    {
+      "id": "d3f1a2b4-7c8e-4f0d-9b1a-2c3d4e5f6789",
+      "type": "deploy",
+      "status": "success",
+      "service": "api",
+      "version": "v1.5.0",
+      "target_version": null,
+      "message": "Agent reported service is healthy.",
+      "error": null,
+      "started_at": 1731678181.0,
+      "finished_at": 1731678194.3
+    }
+  ],
+  "total": 42
+}
+```
+
+</CodeGroup>
+
+---
+
+## GET /operations/:operation_id
+
+Get the full status of a single operation.
+
+**Authentication:** `X-API-Key` required.
+
+### Path parameters
+
+<ParamField path="operation_id" type="string" required>
+  UUID of the operation returned by a deploy, teardown, rollback, or command request.
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="string">
+  UUID of the operation.
+</ResponseField>
+
+<ResponseField name="type" type="string">
+  Operation type: `"deploy"`, `"teardown"`, `"rollback"`, or `"command"`.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current status: `"pending"`, `"running"`, `"success"`, or `"failed"`.
+</ResponseField>
+
+<ResponseField name="service" type="string">
+  Name of the service this operation targets.
+</ResponseField>
+
+<ResponseField name="version" type="string">
+  Version string for deploy operations. May be `null`.
+</ResponseField>
+
+<ResponseField name="target_version" type="string">
+  Target version for rollback operations. May be `null`.
+</ResponseField>
+
+<ResponseField name="healthcheck_url" type="string">
+  URL used to verify the service after a deploy, sourced from the manifest. May be `null`.
+</ResponseField>
+
+<ResponseField name="started_at" type="number">
+  Unix timestamp (float) when the operation was created.
+</ResponseField>
+
+<ResponseField name="finished_at" type="number">
+  Unix timestamp (float) when the operation completed. `null` if still in progress.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable status message.
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Error detail if `status` is `"failed"`. May be `null`.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl http://localhost:8000/operations/d3f1a2b4-7c8e-4f0d-9b1a-2c3d4e5f6789 \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+```json response
+{
+  "id": "d3f1a2b4-7c8e-4f0d-9b1a-2c3d4e5f6789",
+  "type": "deploy",
+  "status": "success",
+  "service": "api",
+  "version": "v1.5.0",
+  "target_version": null,
+  "healthcheck_url": "http://10.0.0.5:8080/health",
+  "started_at": 1731678181.0,
+  "finished_at": 1731678194.3,
+  "message": "Agent reported service is healthy.",
+  "error": null
+}
+```
+
+</CodeGroup>
+
+Returns `404` if no operation with the given ID exists.
+
+---
+
+## GET /operations/audit
+
+Return an audit log of all operations ordered by creation time, newest first. Unlike `GET /operations`, the audit log is designed for traceability: it includes `triggered_by` and `created_at` for every entry.
+
+**Authentication:** `X-API-Key` required.
+
+### Query parameters
+
+<ParamField query="limit" type="integer" default="50">
+  Maximum number of audit entries to return.
+</ParamField>
+
+### Response
+
+Returns an array of audit log objects.
+
+<ResponseField name="id" type="string">
+  UUID of the operation.
+</ResponseField>
+
+<ResponseField name="type" type="string">
+  Operation type: `"deploy"`, `"teardown"`, `"rollback"`, or `"command"`.
+</ResponseField>
+
+<ResponseField name="service" type="string">
+  Name of the target service.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Final or current status of the operation.
+</ResponseField>
+
+<ResponseField name="triggered_by" type="string">
+  Attribution value supplied when the operation was created (e.g., a username or CI job). May be `null`.
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp of when the operation record was created.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable status message.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash curl
+curl "http://localhost:8000/operations/audit?limit=10" \
+  -H "X-API-Key: your-infra-api-key"
+```
+
+```json response
+[
+  {
+    "id": "d3f1a2b4-7c8e-4f0d-9b1a-2c3d4e5f6789",
+    "type": "deploy",
+    "service": "api",
+    "status": "success",
+    "triggered_by": "alice",
+    "created_at": "2024-11-15T14:23:01",
+    "message": "Agent reported service is healthy."
+  },
+  {
+    "id": "f7e6d5c4-3b2a-1908-7e6d-5c4b3a2190ff",
+    "type": "rollback",
+    "service": "api",
+    "status": "success",
+    "triggered_by": "ci",
+    "created_at": "2024-11-15T13:10:45",
+    "message": "Agent reported service is healthy."
+  }
+]
+```
+
+</CodeGroup>
+
+<Tip>
+  Filter by service name or `triggered_by` on the client side if you need per-service or per-user history. Server-side filtering query parameters are not currently supported.
+</Tip>

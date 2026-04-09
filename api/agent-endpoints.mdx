@@ -1,0 +1,232 @@
+---
+title: "Agent endpoints"
+description: "Full reference for the three HTTP endpoints exposed by the Heimdall node agent."
+---
+
+The node agent exposes three endpoints. `/heartbeat` requires no authentication. `/command` and `/inspect` require HMAC-SHA256 request signing — see [Agent overview](/api/agent-overview#authentication) for how to sign requests.
+
+---
+
+## GET /heartbeat
+
+Liveness probe. The control plane's background monitor polls this endpoint every `MONITOR_INTERVAL_SECONDS` (default `5`s) to determine whether a node is online.
+
+No authentication is required.
+
+### Response
+
+<ResponseField name="status" type="string" required>
+  Always `"ok"` when the agent is running.
+</ResponseField>
+
+```json
+{ "status": "ok" }
+```
+
+### Example
+
+```bash
+curl http://<agent-host>:8001/heartbeat
+```
+
+---
+
+## POST /command
+
+Execute a Nix flake on the host. The agent validates the flake, starts `nix run` as a subprocess, and immediately returns `{"status": "accepted"}`. Status updates are pushed back to the control plane asynchronously via webhooks.
+
+<Note>
+  Command execution is asynchronous. The HTTP response comes back as soon as
+  the process is started. The control plane receives `booting`, then
+  `healthy` / `dead` / `failed` status updates over the webhook channel as the
+  service lifecycle progresses.
+</Note>
+
+### Authentication
+
+Required. Include `X-Timestamp` and `X-Signature` headers on every request.
+
+### Request body
+
+<ParamField body="operation_id" type="string" required>
+  Operation ID issued by the control plane. Used for correlating status webhooks
+  back to the originating operation.
+</ParamField>
+
+<ParamField body="service" type="string" required>
+  Logical service name. The agent tracks state, logs, and locks under this name.
+  If a process with this name is already running, the agent sends it `SIGTERM`
+  before starting the new one.
+</ParamField>
+
+<ParamField body="flake" type="string" required>
+  Nix flake reference to execute. The agent runs `nix run <flake>` as a
+  subprocess. Example: `github:org/repo#service`
+</ParamField>
+
+<ParamField body="healthcheck_url" type="string">
+  URL the health check loop polls every 5 seconds to determine service health.
+  If omitted, the agent tracks health by PID liveness only. Example:
+  `http://localhost:3000/health`
+</ParamField>
+
+### Behavior
+
+<Steps>
+  <Step title="Validate the flake">
+    Runs `nix flake show <flake>` to confirm the reference is resolvable. If this
+    fails, the agent returns `{"status": "failed", "error": "invalid flake"}`
+    immediately without starting a process.
+  </Step>
+  <Step title="Terminate the previous process (if any)">
+    If a process is already tracked under the same `service` name and is still
+    running, the agent sends it `SIGTERM` and waits up to 10 seconds for it to
+    exit. If it does not exit within 10 seconds, the request fails with
+    `{"status": "failed", "error": "Old process resisted termination, lock timeout"}`.
+  </Step>
+  <Step title="Start the service">
+    Runs `nix run <flake>` as a subprocess. The process PID and `healthcheck_url`
+    are recorded in `service_state` and written to `state.json`.
+  </Step>
+  <Step title="Send booting webhook">
+    Immediately pushes `{"type": "status", "service": "<name>", "status": "booting"}`
+    to the control plane webhook endpoint.
+  </Step>
+  <Step title="Stream logs">
+    Spawns a background task to read `stdout` and buffer each line for the log
+    flush loop. Lines are also written to `HEIMDALL_LOG_DIR/<service>.log`.
+  </Step>
+  <Step title="Report final status">
+    When the process exits, or when the health check loop detects a status
+    change, the agent sends a `status` webhook with `healthy`, `dead`, `failed`,
+    or `stopped`.
+  </Step>
+</Steps>
+
+### Response
+
+<ResponseField name="status" type="string" required>
+  `"accepted"` if the service was started successfully. `"failed"` if the flake
+  was invalid, the lock timed out, or an unexpected error occurred.
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Error message. Only present when `status` is `"failed"`.
+</ResponseField>
+
+<CodeGroup>
+
+```json 200 accepted
+{ "status": "accepted" }
+```
+
+```json 200 failed
+{ "status": "failed", "error": "invalid flake" }
+```
+
+</CodeGroup>
+
+### Example
+
+```bash
+BODY='{"operation_id":"op-001","service":"my-service","flake":"github:org/repo#my-service","healthcheck_url":"http://localhost:3000/health"}'
+TIMESTAMP=$(date +%s)
+SIGNATURE=$(echo -n "${BODY}${TIMESTAMP}" | openssl dgst -sha256 -hmac "$INFRA_API_KEY" | awk '{print $2}')
+
+curl -X POST http://<agent-host>:8001/command \
+  -H "Content-Type: application/json" \
+  -H "X-Timestamp: $TIMESTAMP" \
+  -H "X-Signature: $SIGNATURE" \
+  -d "$BODY"
+```
+
+---
+
+## POST /inspect
+
+Evaluate the `heimdall-manifest` attribute of a Nix flake and return its contents as JSON. The control plane calls this endpoint to discover what commands and health check configuration a flake exposes before scheduling a deployment.
+
+### Authentication
+
+Required. Include `X-Timestamp` and `X-Signature` headers on every request.
+
+### Request body
+
+<ParamField body="flake" type="string" required>
+  Nix flake reference to inspect. The agent evaluates
+  `<flake>#heimdall-manifest` using `nix eval --json`. Example:
+  `github:org/repo#my-service`
+</ParamField>
+
+### Behavior
+
+The agent runs `nix eval <flake>#heimdall-manifest --json` and parses the output. If the manifest is keyed by system (e.g., `x86_64-linux`), the agent automatically resolves it to the current host's system, returning the inner object rather than the per-system wrapper.
+
+### Response
+
+<ResponseField name="status" type="string" required>
+  `"success"` if the manifest was evaluated and parsed. `"failed"` if the flake
+  reference is invalid, the `heimdall-manifest` attribute does not exist, or
+  the output is not valid JSON.
+</ResponseField>
+
+<ResponseField name="manifest" type="object">
+  The evaluated manifest object. Only present when `status` is `"success"`.
+
+  <Expandable title="manifest properties">
+    <ResponseField name="commands" type="object">
+      Map of named commands the flake exposes.
+    </ResponseField>
+    <ResponseField name="healthcheck_url" type="string">
+      Default health check URL defined in the manifest.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Error output from `nix eval`. Only present when `status` is `"failed"`.
+</ResponseField>
+
+<CodeGroup>
+
+```json 200 success
+{
+  "status": "success",
+  "manifest": {
+    "commands": {
+      "start": "nix run .#my-service"
+    },
+    "healthcheck_url": "http://localhost:3000/health"
+  }
+}
+```
+
+```json 200 failed
+{
+  "status": "failed",
+  "error": "error: attribute 'heimdall-manifest' missing"
+}
+```
+
+</CodeGroup>
+
+### Example
+
+```bash
+BODY='{"flake":"github:org/repo#my-service"}'
+TIMESTAMP=$(date +%s)
+SIGNATURE=$(echo -n "${BODY}${TIMESTAMP}" | openssl dgst -sha256 -hmac "$INFRA_API_KEY" | awk '{print $2}')
+
+curl -X POST http://<agent-host>:8001/inspect \
+  -H "Content-Type: application/json" \
+  -H "X-Timestamp: $TIMESTAMP" \
+  -H "X-Signature: $SIGNATURE" \
+  -d "$BODY"
+```
+
+<Warning>
+  `HEIMDALL_ALLOW_INSECURE_SIGNATURES=1` allows any caller to bypass HMAC
+  verification by sending `X-Signature: default-signature`. This must never be
+  enabled in production — it grants unauthenticated access to execute arbitrary
+  Nix flakes on the host.
+</Warning>

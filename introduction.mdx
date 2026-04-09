@@ -1,0 +1,51 @@
+---
+title: "Introduction"
+description: "Heimdall is a distributed node orchestration and health monitoring platform built with FastAPI, Python, and Nix flakes."
+---
+
+Heimdall derives infrastructure state rather than managing it: your infra becomes a reproducible system graph evaluated across nodes. Operations become messaging (ChatOps as the control plane), failures are modeled and handled automatically, and recovery is built in. It unifies provisioning, deployment, monitoring, and rollback with health-aware execution, structured debugging, and a REST API for live node state.
+
+<Note>
+  Heimdall requires [Nix](https://nixos.org/) with flakes enabled and a Python virtual environment. See the [Quick Start](/quickstart) for setup instructions.
+</Note>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Agent + control plane" icon="server">
+    Agents run workloads and stream state to the control plane over a clean, decoupled REST interface.
+  </Card>
+  <Card title="HMAC-signed webhooks" icon="shield-halved" href="/architecture/webhooks-and-security">
+    All agent-to-control-plane updates are signed with HMAC-SHA256 and include replay-attack protection via timestamps.
+  </Card>
+  <Card title="Health and status tracking" icon="heart-pulse" href="/operations/health-monitoring">
+    Services are automatically marked healthy, dead, or failed based on agent heartbeat signals and configurable thresholds.
+  </Card>
+  <Card title="Reproducible dev environment" icon="snowflake" href="/guides/nix-flake-manifest">
+    A Nix flake pins every dependency — Python 3.14, uv, tmux, and Tailscale — so your environment is identical across machines.
+  </Card>
+</CardGroup>
+
+## Architecture
+
+Agents send `node_status`, `status`, and `logs_batch` events to the control plane's `/webhook` endpoint. All webhook payloads are HMAC-signed with `INFRA_API_KEY`.
+
+```text
+┌──────────────────────┐        signed webhooks        ┌──────────────────────────┐
+│   Agent (node host)  │ ────────────────────────────▶ │     Control Plane        │
+│  - runs services     │                                │   FastAPI + DB           │
+│  - health checks     │                                │   /webhook + /services   │
+│  - logs batching     │ ◀────────────────────────────  │   API + status tracking  │
+└──────────────────────┘        instructions/API        └──────────────────────────┘
+```
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get the control plane and your first agent running in minutes.
+  </Card>
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture/overview">
+    Understand how the control plane, agents, and webhooks fit together.
+  </Card>
+</CardGroup>
